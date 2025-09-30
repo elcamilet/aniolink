@@ -1,9 +1,14 @@
 # An I/O Link - elcamilet.com
+Mi hijo se llama Aniol 😍
 
 Una aplicación para transferencias P2P sin almacenamiento en servidor.
+Creada especialmente para tí con ❤️ y un poco de **AI**uda ;)
 
-**SELF-HOSTED**
-**OPEN-SOURCE**
+Puedes hacerte un **Self-Hosted** con Docker🐳, en toda regla
+
+Adáptalo a tus necesidades y compárteme tus mejoras, es **Open Source**
+
+## Demo (Beta): https://io.elcamilet.com
 
 ## Características Backend
 Python 3
@@ -25,9 +30,10 @@ Vite, React, Tailwind CSS
 ## Contenedores Docker
 
 **Backend**: https://hub.docker.com/r/elcamilet/aniolink
+
 **Frontend**: https://hub.docker.com/r/elcamilet/aniolink-frontend
 
-Dockerfiles preparados para adaptarlos con tus necesidades
+Dockerfiles preparados para adaptarlos a tus necesidades
 
 
 
@@ -49,4 +55,8 @@ Dockerfiles preparados para adaptarlos con tus necesidades
 ##
 > **TIP**: Puedes ver el numero de tokens en uso
 ```curl https://p2p.example.com/status/```
+##
+## elCamilet
+Este software está hecho **"as is"**, tal cual, sin garantías ni tonterías. Puedes usarlo, copiarlo, o lo que quieras, pero no me reproches nada...
 
+Si quieres contactar conmigo, me encontrarás en elcamilet.com
