@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.env
+.venv
+venv/
+pip-wheel-metadata/
+*.egg
+*.manifest
+*.spec
+*.log
+.ipynb_checkpoints
+.pytest_cache/
+.mypy_cache/
+.coverage
+nosetests.xml
+coverage.xml
+
+# React / Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+.pnp.*
+.pnp.js
+
+# Vite
+dist/
+.vite/
+*.local
+
+# TailwindCSS
+# Tailwind no necesita exclusiones específicas aparte de las anteriores,
+# pero ignora node_modules y dist para no subir dependencias ni builds.
+
+# IDEs / Editor
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.log
+
+# Logs
+logs/
+*.log
+
+# System Files
+.DS_Store
+Thumbs.db
+
+# Custom
+NOTES.txt
+.kilocode
+.git.bak
