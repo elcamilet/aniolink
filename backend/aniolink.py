@@ -3,16 +3,19 @@
 import asyncio
 import logging
 import secrets
-import string
+import string as string_mod
 import mimetypes
 import os
 from datetime import datetime, timedelta
+from pathlib import Path
+from string import Template
 from typing import Dict, Optional
 from urllib.parse import unquote
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse, PlainTextResponse
+from fastapi import FastAPI, Request, HTTPException, Query, WebSocket
+from fastapi.responses import StreamingResponse, PlainTextResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from dotenv import load_dotenv
@@ -28,6 +31,9 @@ TIMEOUT_SECONDS = int(os.getenv('TIMEOUT_SECONDS', 3600))  # 1 hora para archivo
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
+
+TEMPLATES_DIR = Path(__file__).parent / "templates"
+DOWNLOAD_TEMPLATE = Template((TEMPLATES_DIR / "download.html").read_text(encoding="utf-8"))
 
 active_bridges: Dict[str, dict] = {}
 
@@ -84,7 +90,7 @@ class P2PBridge:
 
 
 def generate_token() -> str:
-    chars = string.ascii_lowercase + string.digits
+    chars = string_mod.ascii_lowercase + string_mod.digits
     return ''.join(secrets.choice(chars) for _ in range(TOKEN_LENGTH))
 
 def extract_filename(path: str) -> str:
@@ -131,20 +137,6 @@ app.add_middleware(
 )
 
 
-@app.get("/")
-async def home():
-    response_text = f"""
-An I/O Link - elCamilet.com
-===========================
-Transferencia P2P sin almacenamiento en servidor
-
-1. Obtén un token: curl https://{PUBLIC_HOST}/token
-2. Sube un archivo (reemplaza FILE y TOKEN): curl --upload-file FILE https://{PUBLIC_HOST}/TOKEN/
-3. Descarga el archivo (reemplaza TOKEN): curl -O -J https://{PUBLIC_HOST}/TOKEN
-
-"""
-    return PlainTextResponse(content=response_text)
-
 @app.get("/token")
 async def create_token():
     cleanup_expired()
@@ -182,25 +174,13 @@ async def upload_p2p(token: str, filename: str, request: Request):
     content_type = request.headers.get('content-type', 'application/octet-stream')
     content_length = request.headers.get('content-length')
 
-    # Handle both FormData and raw data (curl compatibility)
-    if content_type.startswith('multipart/form-data'):
-        form = await request.form()
-        file = form.get("file")
-        if file:
-            content = file.file
-            if not original_filename or original_filename == "blob":
-                original_filename = file.filename
-            content_type = file.content_type
-    else:
-        content = request.stream()
-    
-    # Try to guess content type from filename if not specified
-    if content_type in ['application/octet-stream', 'multipart/form-data']:
+    # Detectar el content type real por nombre de fichero si no se especifica
+    if content_type == 'application/octet-stream':
         guessed_type, _ = mimetypes.guess_type(original_filename)
         if guessed_type:
             content_type = guessed_type
 
-    bridge.set_upload_info(content, original_filename, content_type, content_length)
+    bridge.set_upload_info(request.stream(), original_filename, content_type, content_length)
     logger.info(f"Subida preparada: {original_filename} - esperando la descarga")
     try:
         await asyncio.wait_for(bridge.download_ready.wait(), timeout=TIMEOUT_SECONDS)
@@ -217,9 +197,23 @@ Transferencia completada con ÉXITO!
         active_bridges.pop(token, None)
 
 @app.get("/{token}")
-async def download_p2p(token: str):
+async def download_p2p(token: str, request: Request, dl: Optional[str] = Query(None)):
+    accept = request.headers.get("accept", "")
+    is_browser = "text/html" in accept and dl is None
+
     if token not in active_bridges:
+        if is_browser:
+            return HTMLResponse(content=DOWNLOAD_TEMPLATE.safe_substitute(
+                token=token,
+                btn_disabled='disabled style="background:#4b5563;cursor:not-allowed"',
+                error_msg='<p style="color:#ef4444;margin-top:1rem;text-align:center">⚠️ Token no encontrado o expirado</p>',
+            ), status_code=404)
         raise HTTPException(status_code=404, detail="Token no encontrado")
+
+    if is_browser:
+        html = DOWNLOAD_TEMPLATE.safe_substitute(token=token, btn_disabled='', error_msg='')
+        return HTMLResponse(content=html)
+
     bridge = active_bridges[token]
     bridge.download_connected.set()
     try:
@@ -259,3 +253,12 @@ Enlaces activos: {len(active_bridges)}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info", timeout_keep_alive=3600)
+
+# Serve frontend SPA — must be mounted last so API routes take priority
+@app.websocket("/{path:path}")
+async def reject_websocket(websocket: WebSocket):
+    """Reject all WebSocket connections before StaticFiles crashes on them."""
+    await websocket.close(code=1008)
+
+if os.path.isdir("static"):
+    app.mount("/", StaticFiles(directory="static", html=True), name="frontend")

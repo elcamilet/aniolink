@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>An I/O Link — Descargar archivo</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #111827; color: #f9fafb; font-family: system-ui, sans-serif; }
+    .slash { color: #ef4444; }
+    .card { background: #1f2937; border-radius: 0.75rem; padding: 1.5rem; max-width: 480px; width: 100%; }
+    .label { color: #9ca3af; font-size: 0.875rem; margin-bottom: 0.5rem; }
+    .token { font-family: monospace; font-size: 1.75rem; color: #2dd4bf; background: #111827; padding: 0.5rem 1.25rem; border-radius: 0.5rem; display: inline-block; margin-bottom: 1.5rem; letter-spacing: 0.2em; }
+    .token-row { text-align: center; }
+    .btn { display: inline-flex; align-items: center; gap: 0.5rem; background: #0d9488; color: white; font-size: 1rem; font-weight: 600; padding: 0.75rem 1.5rem; border-radius: 0.5rem; text-decoration: none; border: none; cursor: pointer; transition: background 0.2s; width: 100%; justify-content: center; }
+    .btn:hover { background: #0f766e; }
+    .btn:disabled { background: #4b5563; cursor: not-allowed; }
+    .progress-section { margin-top: 1rem; background: #374151; border-radius: 0.5rem; padding: 1rem; display: none; }
+    .progress-header { display: flex; justify-content: space-between; font-size: 0.875rem; color: #d1d5db; margin-bottom: 0.25rem; }
+    .progress-track { background: #4b5563; border-radius: 9999px; height: 8px; overflow: hidden; }
+    .progress-bar { background: #0d9488; height: 8px; border-radius: 9999px; width: 0%; transition: width 0.3s ease-out; }
+    .status { margin-top: 0.75rem; font-size: 0.875rem; color: #d1d5db; }
+    .note { margin-top: 1rem; font-size: 0.8rem; color: #6b7280; text-align: center; }
+    .sub { color: #d1d5db; margin-bottom: 2.5rem; }
+  </style>
+</head>
+<body>
+  <div style="min-height:100vh;display:flex;flex-direction:column">
+    <header style="text-align:center;padding:3rem 1rem">
+      <h1 style="font-size:3.75rem;font-weight:700;margin-bottom:1rem;line-height:1">
+        <span>An I</span><span class="slash">/</span><span>O L</span><span class="slash">ink</span>
+      </h1>
+      <p style="font-size:1.25rem;color:#d1d5db">Transferencia P2P sin almacenamiento en servidor</p>
+    </header>
+
+    <main style="flex:1;display:flex;align-items:flex-start;justify-content:center;padding:0 1rem 3rem">
+  <div class="card">
+    <div class="token-row">
+      <p class="label">Token</p>
+      <div class="token">$token</div>
+    </div>
+    <button id="btn" class="btn" onclick="startDownload()" $btn_disabled>
+      <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor" viewBox="0 0 256 256"><path d="M224,152v56a16,16,0,0,1-16,16H48a16,16,0,0,1-16-16V152a8,8,0,0,1,16,0v56H208V152a8,8,0,0,1,16,0Zm-101.66,5.66a8,8,0,0,0,11.32,0l40-40a8,8,0,0,0-11.32-11.32L136,132.69V40a8,8,0,0,0-16,0v92.69L93.66,106.34a8,8,0,0,0-11.32,11.32Z"></path></svg>
+      Descargar Archivo
+    </button>
+    <div id="progress-section" class="progress-section">
+      <div class="progress-header">
+        <span>Progreso de descarga</span>
+        <span id="progress-text">0%</span>
+      </div>
+      <div class="progress-track">
+        <div id="progress-bar" class="progress-bar"></div>
+      </div>
+      <p id="status" class="status"></p>
+    </div>
+    <p class="note">El archivo se transferirá directamente desde el remitente</p>
+    $error_msg
+  </div>
+    </main>
+
+    <footer style="background:#1f2937;border-top:1px solid #374151;padding:1rem 0">
+      <div style="text-align:center">
+        <p style="display:flex;align-items:center;justify-content:center;gap:0.5rem">
+          Hecho con <svg style="width:1.25rem;height:1.25rem;display:inline-block" viewBox="0 0 163.83836 158.46089" xmlns="http://www.w3.org/2000/svg"><path style="fill:#ec003f" d="m 173.27751,117.19664 c 8.95443,-15.99188 16.93438,-36.030858 12.4775,-53.550028 -4.45711,-17.51918 -17.45013,-31.20329 -34.08452,-35.89744 -16.63504,-4.69454 -34.38461,0.30236 -46.56213,13.13948 -12.176948,-12.82427 -29.925238,-17.83326 -46.559258,-13.13948 -16.63454,4.69378 -29.627413,18.37826 -34.084593,35.89744 -4.457596,17.5188 3.520617,37.558148 12.474703,53.550028 15.59737,27.85728 68.169148,67.28063 68.169148,67.28063 0,0 52.5711,-39.42373 68.16915,-67.28063 z" transform="translate(-23.190318,-26.016384)"/></svg> especialmente para ti!
+        </p>
+        <a href="https://elcamilet.com" target="_blank" rel="noopener noreferrer" style="color:#2dd4bf;text-decoration:none">elCamilet.com</a>
+      </div>
+    </footer>
+  </div>
+  <script>
+    async function startDownload() {
+      const btn = document.getElementById('btn');
+      const section = document.getElementById('progress-section');
+      const bar = document.getElementById('progress-bar');
+      const text = document.getElementById('progress-text');
+      const status = document.getElementById('status');
+
+      btn.disabled = true;
+      btn.textContent = 'Descargando...';
+      section.style.display = 'block';
+      status.textContent = 'Conectando...';
+
+      try {
+        const response = await fetch('/$token?dl=1');
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+
+        let filename = 'archivo_descargado';
+        const cd = response.headers.get('content-disposition');
+        if (cd) {
+          const m = cd.match(/filename="([^"]+)"/) || cd.match(/filename=([^;]+)/);
+          if (m) filename = m[1].trim();
+        }
+        const totalSize = parseInt(response.headers.get('content-length') || '0', 10);
+
+        status.textContent = 'Iniciando descarga...';
+
+        if ('showSaveFilePicker' in window) {
+          const fileHandle = await window.showSaveFilePicker({
+            suggestedName: filename,
+            types: [{ description: 'Todos los archivos', accept: { '*/*': ['.*'] } }]
+          });
+          const writable = await fileHandle.createWritable();
+          const reader = response.body.getReader();
+          let received = 0;
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            await writable.write(value);
+            received += value.length;
+            updateProgress(received, totalSize, bar, text, status);
+          }
+          await writable.close();
+        } else {
+          const reader = response.body.getReader();
+          const chunks = [];
+          let received = 0;
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value);
+            received += value.length;
+            updateProgress(received, totalSize, bar, text, status);
+          }
+          const blob = new Blob(chunks, { type: response.headers.get('content-type') || 'application/octet-stream' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url; a.download = filename; a.style.display = 'none';
+          document.body.appendChild(a); a.click();
+          document.body.removeChild(a); URL.revokeObjectURL(url);
+        }
+
+        bar.style.width = '100%';
+        text.textContent = '100%';
+        status.textContent = '¡Descarga completada!';
+        btn.textContent = '¡Completado!';
+
+      } catch (e) {
+        status.textContent = e.name === 'AbortError' ? 'Descarga cancelada.' : 'Error al descargar. Verifica el token.';
+        btn.disabled = false;
+        btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor" viewBox="0 0 256 256"><path d="M224,152v56a16,16,0,0,1-16,16H48a16,16,0,0,1-16-16V152a8,8,0,0,1,16,0v56H208V152a8,8,0,0,1,16,0Zm-101.66,5.66a8,8,0,0,0,11.32,0l40-40a8,8,0,0,0-11.32-11.32L136,132.69V40a8,8,0,0,0-16,0v92.69L93.66,106.34a8,8,0,0,0-11.32,11.32Z"></path></svg> Reintentar';
+      }
+    }
+
+    function updateProgress(received, total, bar, text, status) {
+      if (total > 0) {
+        const pct = Math.round((received * 100) / total);
+        bar.style.width = pct + '%';
+        text.textContent = pct + '%';
+        status.textContent = 'Descargando... ' + pct + '%';
+      } else {
+        const mb = (received / 1024 / 1024).toFixed(1);
+        status.textContent = 'Descargando... ' + mb + ' MB';
+      }
+    }
+  </script>
+</body>
+</html>

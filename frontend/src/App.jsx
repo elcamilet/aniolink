@@ -1,7 +1,6 @@
 import React, { useState, useRef } from 'react';
-import axios from 'axios';
 
-const API_BASE_URL = import.meta.env.API_BASE_URL || 'https://p2p.example.com';
+const API_BASE_URL = window.location.origin;
 
 function App() {
   const [selectedFile, setSelectedFile] = useState(null);
@@ -51,9 +50,8 @@ function App() {
     setIsUploading(true);
     setUploadStatus('Generando token...');
     try {
-      // Generate token using axios
-      const tokenResponse = await axios.get(`${API_BASE_URL}/token`);
-      const tokenText = tokenResponse.data;
+      const tokenResponse = await fetch(`${API_BASE_URL}/token`);
+      const tokenText = await tokenResponse.text();
       const tokenMatch = tokenText.match(/TOKEN: (\w+)/);
       if (!tokenMatch) {
         throw new Error('No se pudo extraer el token');
@@ -65,8 +63,10 @@ function App() {
       setUploadStatus('Esperando conexión P2P...');
       const checkPeerStatus = async () => {
         try {
-          const statusResponse = await axios.get(`${API_BASE_URL}/${newToken}/status`);
-          return statusResponse.data?.ready === true;
+          const statusResponse = await fetch(`${API_BASE_URL}/${newToken}/status`);
+          if (!statusResponse.ok) return false;
+          const data = await statusResponse.json();
+          return data?.ready === true;
         } catch (error) {
           return false;
         }
@@ -91,24 +91,33 @@ function App() {
         throw new Error('peer-disconnected');
       }
       setUploadStatus('¡Conexión P2P establecida! Iniciando transferencia...');
-      const formData = new FormData();
-      formData.append('file', selectedFile);
-      const controller = new AbortController();
-      const uploadResponse = await axios.put(uploadUrl, formData, {
-        headers: { 'Content-Type': 'multipart/form-data', },
-        signal: controller.signal,
-        timeout: 3600000, // 1 hour timeout for large files
-        onUploadProgress: (progressEvent) => {
-          if (progressEvent.total && progressEvent.total > 0) {
-            const progress = Math.round((progressEvent.loaded * 100) / progressEvent.total);
-            setUploadStatus(`Transfiriendo... ${progress}%`);
-          } else {
-            const mbUploaded = (progressEvent.loaded / 1024 / 1024).toFixed(1);
-            setUploadStatus(`Transfiriendo... ${mbUploaded} MB`);
+      const totalBytes = selectedFile.size;
+      let uploadedBytes = 0;
+      const fileStream = selectedFile.stream();
+      const trackingStream = new ReadableStream({
+        async start(controller) {
+          const reader = fileStream.getReader();
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) { controller.close(); break; }
+            uploadedBytes += value.length;
+            const progress = totalBytes > 0 ? Math.round((uploadedBytes * 100) / totalBytes) : 0;
+            setUploadStatus(totalBytes > 0 ? `Transfiriendo... ${progress}%` : `Transfiriendo... ${(uploadedBytes / 1024 / 1024).toFixed(1)} MB`);
+            controller.enqueue(value);
           }
-        },
+        }
       });
-      setUploadStatus('¡Archivo listo para compartir!');
+      const uploadResponse = await fetch(uploadUrl, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': selectedFile.type || 'application/octet-stream',
+          'Content-Length': String(totalBytes),
+        },
+        body: trackingStream,
+        duplex: 'half',
+      });
+      if (!uploadResponse.ok) throw new Error(`HTTP ${uploadResponse.status}`);
+      setUploadStatus('¡Archivo transferido con éxito!');
       setTimeout(() => {
         setSelectedFile(null);
         setUploadStatus('');
@@ -289,7 +298,7 @@ function App() {
       </header>
 
       <main className="flex-1 container mx-auto px-4 max-w-4xl">
-        <div className="grid md:grid-cols-2 gap-8 mb-12">
+        <div className="mb-12">
           <div className="bg-gray-800 rounded-lg p-6">
             <h2 className="text-2xl font-semibold mb-6 text-teal-400"> Enviar Archivo </h2>
             <div className={`border-2 border-dashed rounded-lg p-8 text-center transition-colors cursor-pointer ${
@@ -321,50 +330,17 @@ function App() {
               <div className="mt-4 p-4 bg-teal-900/30 border border-teal-600 rounded-lg">
                 <p className="text-sm text-gray-300 mb-2">Opciones para compartir:</p>
                 <div className="flex items-center gap-2 mb-2">
-                  <code className="flex-1 bg-gray-800 px-3 py-2 rounded text-teal-400 font-mono"> {token} </code>
-                  <button onClick={copyShareToken} className="bg-teal-600 hover:bg-teal-700 px-3 py-2 rounded text-sm transition-colors" > TOKEN </button>
-                </div>
-                <div className="flex items-center gap-2 mb-2">
                   <code className="flex-1 bg-gray-800 px-3 py-2 rounded text-teal-400 font-mono text-sm"> {`${API_BASE_URL}/${token}`} </code>
-                  <button onClick={copyShareUrl} className="bg-teal-600 hover:bg-teal-700 px-3 py-2 rounded text-sm transition-colors" > URL </button>
+                  <button onClick={copyShareUrl} className="flex items-center gap-1 bg-teal-600 hover:bg-teal-700 px-3 py-2 rounded text-sm transition-colors" >
+                    URL <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 256 256"><path d="M216,40V168H168V88H88V40Z" opacity="0.2"></path><path d="M216,32H88a8,8,0,0,0-8,8V80H40a8,8,0,0,0-8,8V216a8,8,0,0,0,8,8H168a8,8,0,0,0,8-8V176h40a8,8,0,0,0,8-8V40A8,8,0,0,0,216,32ZM160,208H48V96H160Zm48-48H176V88a8,8,0,0,0-8-8H96V48H208Z"></path></svg>
+                  </button>
                 </div>
                 <div className="flex items-center gap-2">
                   <code className="flex-1 bg-gray-800 px-3 py-2 rounded text-teal-400 font-mono text-xs"> {`curl -O -J ${API_BASE_URL}/${token}`} </code>
-                  <button onClick={copyShareCurl} className="bg-teal-600 hover:bg-teal-700 px-3 py-2 rounded text-sm transition-colors" > CURL </button>
+                  <button onClick={copyShareCurl} className="flex items-center gap-1 bg-teal-600 hover:bg-teal-700 px-3 py-2 rounded text-sm transition-colors" >
+                    CURL <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 256 256"><path d="M216,40V168H168V88H88V40Z" opacity="0.2"></path><path d="M216,32H88a8,8,0,0,0-8,8V80H40a8,8,0,0,0-8,8V216a8,8,0,0,0,8,8H168a8,8,0,0,0,8-8V176h40a8,8,0,0,0,8-8V40A8,8,0,0,0,216,32ZM160,208H48V96H160Zm48-48H176V88a8,8,0,0,0-8-8H96V48H208Z"></path></svg>
+                  </button>
                 </div>
-              </div>
-            )}
-          </div>
-          <div className="bg-gray-800 rounded-lg p-6">
-            <h2 className="text-2xl font-semibold mb-6 text-teal-400"> Recibir Archivo </h2>
-            <div className="space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-300 mb-2"> Token o URL de descarga: </label>
-                <input type="text" value={downloadToken} onChange={(e) => setDownloadToken(e.target.value)} placeholder="Pega aquí el token o URL completa" className="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-3 text-white placeholder-gray-400 focus:outline-none focus:border-teal-400 focus:ring-1 focus:ring-teal-400" />
-              </div>
-              <button onClick={handleDownload} disabled={!downloadToken.trim() || isDownloading} className="w-full bg-teal-600 hover:bg-teal-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white font-semibold py-3 px-6 rounded-lg transition-colors" >
-                {isDownloading ? 'Descargando...' : 'Descargar Archivo'}
-              </button>
-            </div>
-            {isDownloading && (
-              <div className="mt-4 p-4 bg-gray-700 rounded-lg">
-                <div className="mb-2">
-                  <div className="flex justify-between text-sm text-gray-300 mb-1">
-                    <span>Progreso de descarga</span>
-                    <span>{downloadProgress}%</span>
-                  </div>
-                  <div className="w-full bg-gray-600 rounded-full h-2">
-                    <div className="bg-teal-600 h-2 rounded-full transition-all duration-300 ease-out" style={{ width: `${downloadProgress}%` }}></div>
-                  </div>
-                </div>
-                {downloadStatus && (
-                  <p className="text-sm text-gray-300">{downloadStatus}</p>
-                )}
-              </div>
-            )}
-            {downloadStatus && !isDownloading && (
-              <div className="mt-4 p-3 bg-gray-700 rounded-lg">
-                <p className="text-sm text-gray-300">{downloadStatus}</p>
               </div>
             )}
           </div>
@@ -424,7 +400,7 @@ function App() {
       </main>
       <footer className="bg-gray-800 border-t border-gray-700 py-4">
         <div className="container mx-auto px-4 text-center">
-          <p className="flex items-center justify-center gap-2">Hecho con <img src="/heart.svg" alt="heart" className="w-5 h-5" /> especialmente para ti!</p>
+          <p className="flex items-center justify-center gap-2">Hecho con <svg style={{width:'1.25rem',height:'1.25rem',display:'inline-block'}} viewBox="0 0 163.83836 158.46089" xmlns="http://www.w3.org/2000/svg"><path style={{fill:'#ec003f'}} d="m 173.27751,117.19664 c 8.95443,-15.99188 16.93438,-36.030858 12.4775,-53.550028 -4.45711,-17.51918 -17.45013,-31.20329 -34.08452,-35.89744 -16.63504,-4.69454 -34.38461,0.30236 -46.56213,13.13948 -12.176948,-12.82427 -29.925238,-17.83326 -46.559258,-13.13948 -16.63454,4.69378 -29.627413,18.37826 -34.084593,35.89744 -4.457596,17.5188 3.520617,37.558148 12.474703,53.550028 15.59737,27.85728 68.169148,67.28063 68.169148,67.28063 0,0 52.5711,-39.42373 68.16915,-67.28063 z" transform="translate(-23.190318,-26.016384)"/></svg> especialmente para ti!</p>
           <a href="https://elcamilet.com" target="_blank" rel="noopener noreferrer" className="text-teal-400 hover:underline"> elCamilet.com</a>
         </div>
       </footer>
