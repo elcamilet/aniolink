@@ -144,13 +144,13 @@ async def create_token():
     active_bridges[token] = P2PBridge(token)
     logger.info(f"Token created: {token}")
     response_text = f"""
-
+---------------------------------------------
 Se ha generado el TOKEN: {token}
 El token expira en {TIMEOUT_SECONDS // 60} minutos
 
 ENVIAR: curl --upload-file FILE https://{PUBLIC_HOST}/{token}/
 RECIBIR: curl -O -J https://{PUBLIC_HOST}/{token}
-
+---------------------------------------------
 """
     return PlainTextResponse(content=response_text.strip())
 
@@ -186,9 +186,9 @@ async def upload_p2p(token: str, filename: str, request: Request):
         await asyncio.wait_for(bridge.download_ready.wait(), timeout=TIMEOUT_SECONDS)
         await bridge.transfer_complete.wait()
         response_text = f"""
-
+---------------------------------------------
 Transferencia completada con ÉXITO!
-
+---------------------------------------------
 """
         return PlainTextResponse(content=response_text.strip())
     except asyncio.TimeoutError:
@@ -238,12 +238,13 @@ async def status():
     cleanup_expired()
     now = datetime.now()
     response_text = f"""
+---------------------------------------------
 An I/O Link - elCamilet.com
 
 Transferencia P2P sin almacenamiento en servidor
 
 Enlaces activos: {len(active_bridges)}
-
+---------------------------------------------
 """
     if not active_bridges:
         response_text += "No hay transferencias activas en este momento.\n"
