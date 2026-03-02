@@ -1,6 +1,14 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 
 const API_BASE_URL = window.location.origin;
+const WS_BASE_URL = API_BASE_URL.replace(/^http/, 'ws');
+
+const ICE_SERVERS = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+  ],
+};
 
 function App() {
   const [selectedFile, setSelectedFile] = useState(null);
@@ -13,6 +21,16 @@ function App() {
   const [downloadStatus, setDownloadStatus] = useState('');
   const [isDragOver, setIsDragOver] = useState(false);
   const fileInputRef = useRef(null);
+
+  // Leer token de URL params (cuando se redirige desde /{token})
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const t = params.get('token');
+    if (t) {
+      setDownloadToken(t);
+      window.history.replaceState({}, '', '/');
+    }
+  }, []);
 
   const handleFileSelect = (file) => {
     setSelectedFile(file);
@@ -49,217 +67,229 @@ function App() {
     if (!selectedFile) return;
     setIsUploading(true);
     setUploadStatus('Generando token...');
+    let ws = null;
+    let pc = null;
     try {
+      // 1. Obtener token
       const tokenResponse = await fetch(`${API_BASE_URL}/token`);
       const tokenText = await tokenResponse.text();
       const tokenMatch = tokenText.match(/TOKEN: (\w+)/);
-      if (!tokenMatch) {
-        throw new Error('No se pudo extraer el token');
-      }
+      if (!tokenMatch) throw new Error('No se pudo extraer el token');
       const newToken = tokenMatch[1];
       setToken(newToken);
-      setUploadStatus('Token generado. Preparando subida...');
-      const uploadUrl = `${API_BASE_URL}/${newToken}/${encodeURIComponent(selectedFile.name)}`;
-      setUploadStatus('Esperando conexión P2P...');
-      const checkPeerStatus = async () => {
-        try {
-          const statusResponse = await fetch(`${API_BASE_URL}/${newToken}/status`);
-          if (!statusResponse.ok) return false;
-          const data = await statusResponse.json();
-          return data?.ready === true;
-        } catch (error) {
-          return false;
+      setUploadStatus('Esperando conexión del receptor...');
+
+      // 2. Conectar WebSocket de señalización
+      ws = new WebSocket(`${WS_BASE_URL}/${newToken}/signal`);
+      await new Promise((resolve, reject) => {
+        ws.onopen = () => resolve();
+        ws.onerror = () => reject(new Error('Error al conectar servidor de señalización'));
+        setTimeout(() => reject(new Error('Timeout de conexión al servidor')), 10000);
+      });
+
+      // 3. Crear RTCPeerConnection con DataChannel
+      pc = new RTCPeerConnection(ICE_SERVERS);
+      const dc = pc.createDataChannel('file', { ordered: true });
+
+      pc.onicecandidate = ({ candidate }) => {
+        if (candidate && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'ice', candidate: candidate.toJSON() }));
         }
       };
-      let isPeerReady = false;
-      const maxAttempts = 120; // 2 minutes (120 * 1000ms)
-      let attempts = 0;
-      while (!isPeerReady && attempts < maxAttempts) {
-        isPeerReady = await checkPeerStatus();
-        if (!isPeerReady) {
-          await new Promise(resolve => setTimeout(resolve, 1000));
-          attempts++;
-          setUploadStatus(`Esperando conexión P2P... (${maxAttempts - attempts} segundos restantes)`);
-        }
-      }
-      if (!isPeerReady) {
-        throw new Error('timeout-no-peer');
-      }
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      const finalCheck = await checkPeerStatus();
-      if (!finalCheck) {
-        throw new Error('peer-disconnected');
-      }
-      setUploadStatus('¡Conexión P2P establecida! Iniciando transferencia...');
-      const totalBytes = selectedFile.size;
-      let uploadedBytes = 0;
-      const fileStream = selectedFile.stream();
-      const trackingStream = new ReadableStream({
-        async start(controller) {
-          const reader = fileStream.getReader();
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) { controller.close(); break; }
-            uploadedBytes += value.length;
-            const progress = totalBytes > 0 ? Math.round((uploadedBytes * 100) / totalBytes) : 0;
-            setUploadStatus(totalBytes > 0 ? `Transfiriendo... ${progress}%` : `Transfiriendo... ${(uploadedBytes / 1024 / 1024).toFixed(1)} MB`);
-            controller.enqueue(value);
-          }
-        }
+
+      // 4. Esperar peer, señalizar y transferir
+      await new Promise((resolve, reject) => {
+        ws.onmessage = async (event) => {
+          try {
+            const msg = JSON.parse(event.data);
+            if (msg.type === 'peer_connected') {
+              setUploadStatus('¡Receptor conectado! Iniciando WebRTC...');
+              const offer = await pc.createOffer();
+              await pc.setLocalDescription(offer);
+              ws.send(JSON.stringify({ type: 'offer', sdp: offer.sdp }));
+            } else if (msg.type === 'answer') {
+              await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+            } else if (msg.type === 'ice' && msg.candidate) {
+              await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+            } else if (msg.type === 'peer_disconnected') {
+              reject(new Error('El receptor se desconectó antes de completar la transferencia'));
+            }
+          } catch (e) { reject(e); }
+        };
+
+        dc.onopen = async () => {
+          try {
+            setUploadStatus('Conexión P2P directa establecida. Transfiriendo...');
+            const file = selectedFile;
+            // Enviar metadatos al servidor (para endpoint /info) y al peer via DataChannel
+            const metadata = { type: 'metadata', name: file.name, size: file.size, mime: file.type || 'application/octet-stream' };
+            if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(metadata));
+            dc.send(JSON.stringify(metadata));
+
+            // Enviar archivo en chunks con control de flujo (backpressure)
+            const CHUNK = 64 * 1024;
+            let offset = 0;
+            while (offset < file.size) {
+              while (dc.bufferedAmount > 2 * 1024 * 1024) {
+                await new Promise(r => setTimeout(r, 30));
+              }
+              const slice = file.slice(offset, Math.min(offset + CHUNK, file.size));
+              const buf = await slice.arrayBuffer();
+              dc.send(buf);
+              offset += buf.byteLength;
+              setUploadStatus(`Transfiriendo... ${Math.round((offset / file.size) * 100)}%`);
+            }
+            dc.close();
+            setUploadStatus('¡Archivo transferido con éxito!');
+            resolve();
+          } catch (e) { reject(e); }
+        };
+
+        dc.onerror = () => reject(new Error('Error en el canal de datos P2P'));
+        pc.onconnectionstatechange = () => {
+          if (pc.connectionState === 'failed') reject(new Error('Conexión WebRTC fallida'));
+        };
+        ws.onerror = () => reject(new Error('Error de WebSocket'));
       });
-      const uploadResponse = await fetch(uploadUrl, {
-        method: 'PUT',
-        headers: {
-          'Content-Type': selectedFile.type || 'application/octet-stream',
-          'Content-Length': String(totalBytes),
-        },
-        body: trackingStream,
-        duplex: 'half',
-      });
-      if (!uploadResponse.ok) throw new Error(`HTTP ${uploadResponse.status}`);
-      setUploadStatus('¡Archivo transferido con éxito!');
+
       setTimeout(() => {
         setSelectedFile(null);
         setUploadStatus('');
         setToken('');
-        if (fileInputRef.current) {
-          fileInputRef.current.value = '';
-        }
+        if (fileInputRef.current) fileInputRef.current.value = '';
       }, 3000);
     } catch (error) {
-      console.error('Error:', error);
-      let errorMessage = 'Error al subir el archivo. Inténtalo de nuevo.';
-      if (error.message === 'timeout-no-peer') {
-        errorMessage = 'Tiempo de espera agotado. Nadie se conectó para descargar.';
-      } else if (error.message === 'peer-disconnected') {
-        errorMessage = 'El destinatario se desconectó antes de iniciar la transferencia.';
-      } else if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
-        errorMessage = 'Tiempo de espera agotado durante la transferencia.';
-      } else if (error.response?.status === 408) {
-        errorMessage = 'La conexión P2P se perdió durante la transferencia.';
-      } else if (error.response?.status === 404) {
-        errorMessage = 'Token inválido o expirado.';
-      } else if (error.message.includes('Network Error')) {
-        errorMessage = 'Error de conexión. Verifica tu internet.';
-      }
-      setUploadStatus(errorMessage);
-      setTimeout(() => {
-        setUploadStatus('');
-      }, 5000);
+      console.error('Error upload:', error);
+      setUploadStatus(`Error: ${error.message}`);
+      setTimeout(() => setUploadStatus(''), 5000);
     } finally {
+      if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+      if (pc) pc.close();
       setIsUploading(false);
     }
   };
 
   const handleDownload = async () => {
-    if (!downloadToken.trim()) return
-    setIsDownloading(true)
-    setDownloadProgress(0)
-    setDownloadStatus('Conectando...')
+    if (!downloadToken.trim()) return;
+    setIsDownloading(true);
+    setDownloadProgress(0);
+    setDownloadStatus('Conectando...');
+    let ws = null;
+    let pc = null;
     try {
-      const downloadUrl = `${API_BASE_URL}/${downloadToken.trim()}`
-      const response = await fetch(downloadUrl, {
-        method: 'GET',
-        headers: { 'Accept': '*/*' }
-      })
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`)
-      }
-      let filename = 'archivo_descargado'
-      const contentDisposition = response.headers.get('content-disposition')
-      if (contentDisposition) {
-        const filenameMatch = contentDisposition.match(/filename="([^"]+)"/) || contentDisposition.match(/filename=([^;]+)/)
-        if (filenameMatch) {
-          filename = filenameMatch[1].trim()
+      const tok = downloadToken.trim();
+      ws = new WebSocket(`${WS_BASE_URL}/${tok}/signal`);
+      await new Promise((resolve, reject) => {
+        ws.onopen = () => resolve();
+        ws.onerror = () => reject(new Error('Error al conectar servidor de señalización'));
+        setTimeout(() => reject(new Error('Timeout de conexión al servidor')), 10000);
+      });
+
+      pc = new RTCPeerConnection(ICE_SERVERS);
+
+      pc.onicecandidate = ({ candidate }) => {
+        if (candidate && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'ice', candidate: candidate.toJSON() }));
         }
-      }
-      const contentLength = response.headers.get('content-length')
-      const totalSize = contentLength ? parseInt(contentLength, 10) : 0
-      setDownloadStatus('Descarga iniciada...')
-      if ('showSaveFilePicker' in window) {
-        const fileHandle = await window.showSaveFilePicker({
-          suggestedName: filename,
-          types: [{
-            description: 'Todos los archivos',
-            accept: { '*/*': ['.*'] }
-          }]
-        })
-        setDownloadStatus('Iniciando descarga...')
-        const writableStream = await fileHandle.createWritable()
-        const reader = response.body.getReader()
-        let receivedLength = 0
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-          await writableStream.write(value)
-          receivedLength += value.length
-          if (totalSize > 0) {
-            const progress = Math.round((receivedLength * 100) / totalSize)
-            setDownloadProgress(progress)
-            setDownloadStatus(`Descargando... ${progress}%`)
-          } else {
-            const mbDownloaded = (receivedLength / 1024 / 1024).toFixed(1)
-            setDownloadStatus(`Descargando... ${mbDownloaded} MB`)
-          }
-        }
-        await writableStream.close()
-        setDownloadStatus('¡Descarga completada!')
-      } else {
-        const link = document.createElement('a')
-        link.download = filename
-        link.style.display = 'none'
-        document.body.appendChild(link)
-        setDownloadStatus('Iniciando descarga...')
-        const reader = response.body.getReader()
-        const chunks = []
-        let receivedLength = 0
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-          chunks.push(value)
-          receivedLength += value.length
-          if (totalSize > 0) {
-            const progress = Math.round((receivedLength * 100) / totalSize)
-            setDownloadProgress(progress)
-            setDownloadStatus(`Descargando... ${progress}%`)
-          } else {
-            const mbDownloaded = (receivedLength / 1024 / 1024).toFixed(1)
-            setDownloadStatus(`Descargando... ${mbDownloaded} MB`)
-          }
-        }
-        const blob = new Blob(chunks, {
-          type: response.headers.get('content-type') || 'application/octet-stream'
-        })
-        const url = URL.createObjectURL(blob)
-        link.href = url
-        link.click()
-        document.body.removeChild(link)
-        URL.revokeObjectURL(url)
-        setDownloadStatus('¡Descarga completada!')
-      }
+      };
+
+      setDownloadStatus('Esperando al emisor...');
+
+      await new Promise((resolve, reject) => {
+        let metadata = null;
+        const chunks = [];
+        let receivedSize = 0;
+        const iceBuf = [];
+        let remoteSet = false;
+
+        ws.onmessage = async (event) => {
+          try {
+            const msg = JSON.parse(event.data);
+            if (msg.type === 'peer_connected') {
+              setDownloadStatus('Emisor conectado, estableciendo P2P...');
+            } else if (msg.type === 'offer') {
+              await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+              remoteSet = true;
+              for (const c of iceBuf) await pc.addIceCandidate(new RTCIceCandidate(c));
+              iceBuf.length = 0;
+              const answer = await pc.createAnswer();
+              await pc.setLocalDescription(answer);
+              ws.send(JSON.stringify({ type: 'answer', sdp: answer.sdp }));
+              setDownloadStatus('Estableciendo conexión P2P directa...');
+            } else if (msg.type === 'ice' && msg.candidate) {
+              if (remoteSet) await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+              else iceBuf.push(msg.candidate);
+            } else if (msg.type === 'peer_disconnected') {
+              reject(new Error('El emisor se desconectó'));
+            }
+          } catch (e) { reject(e); }
+        };
+
+        pc.ondatachannel = (event) => {
+          const dc = event.channel;
+          setDownloadStatus('Canal P2P directo abierto. Recibiendo...');
+
+          dc.onmessage = (evt) => {
+            if (typeof evt.data === 'string') {
+              const msg = JSON.parse(evt.data);
+              if (msg.type === 'metadata') {
+                metadata = msg;
+                setDownloadStatus(`Recibiendo: ${metadata.name}`);
+              }
+            } else {
+              chunks.push(evt.data);
+              receivedSize += evt.data.byteLength;
+              if (metadata?.size > 0) {
+                const pct = Math.round((receivedSize / metadata.size) * 100);
+                setDownloadProgress(pct);
+                setDownloadStatus(`Descargando... ${pct}%`);
+              } else {
+                setDownloadStatus(`Descargando... ${(receivedSize / 1024 / 1024).toFixed(1)} MB`);
+              }
+            }
+          };
+
+          dc.onclose = () => {
+            const blob = new Blob(chunks, { type: metadata?.mime || 'application/octet-stream' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = metadata?.name || 'archivo';
+            a.style.display = 'none';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(url), 60000);
+            setDownloadStatus('¡Descarga completada!');
+            resolve();
+          };
+
+          dc.onerror = () => reject(new Error('Error en el canal de datos P2P'));
+        };
+
+        pc.onconnectionstatechange = () => {
+          if (pc.connectionState === 'failed') reject(new Error('Conexión WebRTC fallida'));
+        };
+        ws.onerror = () => reject(new Error('Error de WebSocket'));
+        setTimeout(() => reject(new Error('Tiempo de espera agotado')), 600000);
+      });
+
       setTimeout(() => {
-        setDownloadToken('')
-        setDownloadStatus('')
-        setDownloadProgress(0)
-      }, 3000)
+        setDownloadToken('');
+        setDownloadStatus('');
+        setDownloadProgress(0);
+      }, 3000);
     } catch (error) {
-      let errorMessage = 'Error al descargar el archivo. Verifica el token.'
-      if (error.message.includes('404')) {
-        errorMessage = 'Token no encontrado o expirado.'
-      } else if (error.message.includes('408')) {
-        errorMessage = 'No hay archivo disponible para este token.'
-      } else if (error.message.includes('cancelada')) {
-        errorMessage = 'Descarga cancelada por el usuario.'
-      } else if (error.name === 'NetworkError') {
-        errorMessage = 'Error de conexión. Verifica tu internet.'
-      }
-      setDownloadStatus(errorMessage)
+      console.error('Error descarga:', error);
+      setDownloadStatus(`Error: ${error.message}`);
       setTimeout(() => {
-        setDownloadStatus('')
-        setDownloadProgress(0)
-      }, 5000)
+        setDownloadStatus('');
+        setDownloadProgress(0);
+      }, 5000);
     } finally {
-      setIsDownloading(false)
+      if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+      if (pc) pc.close();
+      setIsDownloading(false);
     }
   }
 
@@ -401,7 +431,7 @@ function App() {
       <footer className="bg-gray-800 border-t border-gray-700 py-4">
         <div className="container mx-auto px-4 text-center">
           <p className="flex items-center justify-center gap-2">Hecho con <svg style={{width:'1.25rem',height:'1.25rem',display:'inline-block'}} viewBox="0 0 163.83836 158.46089" xmlns="http://www.w3.org/2000/svg"><path style={{fill:'#ec003f'}} d="m 173.27751,117.19664 c 8.95443,-15.99188 16.93438,-36.030858 12.4775,-53.550028 -4.45711,-17.51918 -17.45013,-31.20329 -34.08452,-35.89744 -16.63504,-4.69454 -34.38461,0.30236 -46.56213,13.13948 -12.176948,-12.82427 -29.925238,-17.83326 -46.559258,-13.13948 -16.63454,4.69378 -29.627413,18.37826 -34.084593,35.89744 -4.457596,17.5188 3.520617,37.558148 12.474703,53.550028 15.59737,27.85728 68.169148,67.28063 68.169148,67.28063 0,0 52.5711,-39.42373 68.16915,-67.28063 z" transform="translate(-23.190318,-26.016384)"/></svg> especialmente para ti!</p>
-          <a href="https://elcamilet.com" target="_blank" rel="noopener noreferrer" className="text-teal-400 hover:underline"> elCamilet.com</a>
+          <a href="https://github.com/elcamilet/aniolink" target="_blank" rel="noopener noreferrer" className="text-teal-400 hover:underline"> Open Source Code</a> - <a href="https://elcamilet.com" target="_blank" rel="noopener noreferrer" className="text-teal-400 hover:underline"> elCamilet.com</a>
         </div>
       </footer>
     </div>

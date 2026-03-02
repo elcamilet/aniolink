@@ -63,11 +63,15 @@
         <p style="display:flex;align-items:center;justify-content:center;gap:0.5rem">
           Hecho con <svg style="width:1.25rem;height:1.25rem;display:inline-block" viewBox="0 0 163.83836 158.46089" xmlns="http://www.w3.org/2000/svg"><path style="fill:#ec003f" d="m 173.27751,117.19664 c 8.95443,-15.99188 16.93438,-36.030858 12.4775,-53.550028 -4.45711,-17.51918 -17.45013,-31.20329 -34.08452,-35.89744 -16.63504,-4.69454 -34.38461,0.30236 -46.56213,13.13948 -12.176948,-12.82427 -29.925238,-17.83326 -46.559258,-13.13948 -16.63454,4.69378 -29.627413,18.37826 -34.084593,35.89744 -4.457596,17.5188 3.520617,37.558148 12.474703,53.550028 15.59737,27.85728 68.169148,67.28063 68.169148,67.28063 0,0 52.5711,-39.42373 68.16915,-67.28063 z" transform="translate(-23.190318,-26.016384)"/></svg> especialmente para ti!
         </p>
-        <a href="https://elcamilet.com" target="_blank" rel="noopener noreferrer" style="color:#2dd4bf;text-decoration:none">elCamilet.com</a>
+        <a href="https://github.com/elcamilet/aniolink" target="_blank" rel="noopener noreferrer" className="text-teal-400 hover:underline"> Open Source Code</a> - <a href="https://elcamilet.com" target="_blank" rel="noopener noreferrer" className="text-teal-400 hover:underline"> elCamilet.com</a>
       </div>
     </footer>
   </div>
   <script>
+    const TOKEN = '$token';
+    const WS_URL = window.location.origin.replace(/^http/, 'ws') + '/' + TOKEN + '/signal';
+    const ICE = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }] };
+
     async function startDownload() {
       const btn = document.getElementById('btn');
       const section = document.getElementById('progress-section');
@@ -76,68 +80,111 @@
       const status = document.getElementById('status');
 
       btn.disabled = true;
-      btn.textContent = 'Descargando...';
+      btn.textContent = 'Conectando...';
       section.style.display = 'block';
-      status.textContent = 'Conectando...';
+      status.textContent = 'Conectando al servidor de señalización...';
 
+      let ws = null;
+      let pc = null;
       try {
-        const response = await fetch('/$token?dl=1');
-        if (!response.ok) throw new Error('HTTP ' + response.status);
+        ws = new WebSocket(WS_URL);
+        await new Promise((resolve, reject) => {
+          ws.onopen = () => resolve();
+          ws.onerror = () => reject(new Error('Error al conectar'));
+          setTimeout(() => reject(new Error('Timeout')), 10000);
+        });
 
-        let filename = 'archivo_descargado';
-        const cd = response.headers.get('content-disposition');
-        if (cd) {
-          const m = cd.match(/filename="([^"]+)"/) || cd.match(/filename=([^;]+)/);
-          if (m) filename = m[1].trim();
-        }
-        const totalSize = parseInt(response.headers.get('content-length') || '0', 10);
+        pc = new RTCPeerConnection(ICE);
+        pc.onicecandidate = ({ candidate }) => {
+          if (candidate && ws.readyState === WebSocket.OPEN)
+            ws.send(JSON.stringify({ type: 'ice', candidate: candidate.toJSON() }));
+        };
 
-        status.textContent = 'Iniciando descarga...';
+        status.textContent = 'Esperando al emisor...';
 
-        if ('showSaveFilePicker' in window) {
-          const fileHandle = await window.showSaveFilePicker({
-            suggestedName: filename,
-            types: [{ description: 'Todos los archivos', accept: { '*/*': ['.*'] } }]
-          });
-          const writable = await fileHandle.createWritable();
-          const reader = response.body.getReader();
-          let received = 0;
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            await writable.write(value);
-            received += value.length;
-            updateProgress(received, totalSize, bar, text, status);
-          }
-          await writable.close();
-        } else {
-          const reader = response.body.getReader();
+        await new Promise((resolve, reject) => {
+          let metadata = null;
           const chunks = [];
-          let received = 0;
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            chunks.push(value);
-            received += value.length;
-            updateProgress(received, totalSize, bar, text, status);
-          }
-          const blob = new Blob(chunks, { type: response.headers.get('content-type') || 'application/octet-stream' });
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url; a.download = filename; a.style.display = 'none';
-          document.body.appendChild(a); a.click();
-          document.body.removeChild(a); URL.revokeObjectURL(url);
-        }
+          let receivedSize = 0;
+          const iceBuf = [];
+          let remoteSet = false;
+
+          ws.onmessage = async (event) => {
+            try {
+              const msg = JSON.parse(event.data);
+              if (msg.type === 'peer_connected') {
+                status.textContent = 'Emisor conectado, estableciendo P2P...';
+              } else if (msg.type === 'offer') {
+                await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+                remoteSet = true;
+                for (const c of iceBuf) await pc.addIceCandidate(new RTCIceCandidate(c));
+                iceBuf.length = 0;
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                ws.send(JSON.stringify({ type: 'answer', sdp: answer.sdp }));
+                status.textContent = 'Estableciendo conexión P2P directa...';
+              } else if (msg.type === 'ice' && msg.candidate) {
+                if (remoteSet) await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+                else iceBuf.push(msg.candidate);
+              } else if (msg.type === 'peer_disconnected') {
+                reject(new Error('El emisor se desconectó'));
+              }
+            } catch (e) { reject(e); }
+          };
+
+          pc.ondatachannel = (event) => {
+            const dc = event.channel;
+            status.textContent = 'Canal P2P directo abierto. Recibiendo...';
+
+            dc.onmessage = (evt) => {
+              if (typeof evt.data === 'string') {
+                const m = JSON.parse(evt.data);
+                if (m.type === 'metadata') {
+                  metadata = m;
+                  status.textContent = 'Recibiendo: ' + metadata.name;
+                }
+              } else {
+                chunks.push(evt.data);
+                receivedSize += evt.data.byteLength;
+                updateProgress(receivedSize, metadata ? metadata.size : 0, bar, text, status);
+              }
+            };
+
+            dc.onclose = () => {
+              const blob = new Blob(chunks, { type: metadata ? metadata.mime : 'application/octet-stream' });
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = metadata ? metadata.name : 'archivo';
+              a.style.display = 'none';
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+              setTimeout(() => URL.revokeObjectURL(url), 60000);
+              resolve();
+            };
+
+            dc.onerror = () => reject(new Error('Error en canal de datos'));
+          };
+
+          pc.onconnectionstatechange = () => {
+            if (pc.connectionState === 'failed') reject(new Error('Conexión WebRTC fallida'));
+          };
+          ws.onerror = () => reject(new Error('Error de WebSocket'));
+          setTimeout(() => reject(new Error('Tiempo de espera agotado')), 600000);
+        });
 
         bar.style.width = '100%';
         text.textContent = '100%';
         status.textContent = '¡Descarga completada!';
         btn.textContent = '¡Completado!';
-
       } catch (e) {
-        status.textContent = e.name === 'AbortError' ? 'Descarga cancelada.' : 'Error al descargar. Verifica el token.';
+        status.textContent = '❌ ' + (e.message || 'Error desconocido');
         btn.disabled = false;
         btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor" viewBox="0 0 256 256"><path d="M224,152v56a16,16,0,0,1-16,16H48a16,16,0,0,1-16-16V152a8,8,0,0,1,16,0v56H208V152a8,8,0,0,1,16,0Zm-101.66,5.66a8,8,0,0,0,11.32,0l40-40a8,8,0,0,0-11.32-11.32L136,132.69V40a8,8,0,0,0-16,0v92.69L93.66,106.34a8,8,0,0,0-11.32,11.32Z"></path></svg> Reintentar';
+      } finally {
+        if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+        if (pc) pc.close();
       }
     }
 

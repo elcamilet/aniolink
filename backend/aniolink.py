@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import asyncio
+import json
 import logging
 import secrets
 import string as string_mod
@@ -13,7 +14,7 @@ from typing import Dict, Optional
 from urllib.parse import unquote
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, HTTPException, Query, WebSocket
+from fastapi import FastAPI, Request, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, PlainTextResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,16 +41,22 @@ active_bridges: Dict[str, dict] = {}
 class P2PBridge:
     def __init__(self, token: str):
         self.token = token
-        self.upload_ready = asyncio.Event()  # Indica que el uploader está listo para enviar
-        self.download_connected = asyncio.Event()  # Indica que el downloader está conectado
-        self.download_ready = asyncio.Event()  # Indica que el downloader está listo para recibir
-        self.stream_started = asyncio.Event()  # Indica que la transferencia ha comenzado
+        # HTTP relay (para curl)
+        self.upload_ready = asyncio.Event()
+        self.download_connected = asyncio.Event()
+        self.download_ready = asyncio.Event()
+        self.stream_started = asyncio.Event()
         self.upload_stream = None
         self.filename = "file.bin"
         self.content_type = 'application/octet-stream'
         self.content_length = None
         self.created = datetime.now()
         self.transfer_complete = asyncio.Event()
+        # WebRTC signaling
+        self.up_ws: Optional[WebSocket] = None
+        self.down_ws: Optional[WebSocket] = None
+        self.signal_lock = asyncio.Lock()
+        self.ws_metadata: Optional[dict] = None
         
     def set_upload_info(self, stream, filename, content_type, content_length):
         self.upload_stream = stream
@@ -122,7 +129,7 @@ async def lifespan(app: FastAPI):
         pass
 
 app = FastAPI(
-    title="An I/O Link - elCamilet.com", 
+    title="An I/O Link - io.elCamilet.com", 
     version="2.0.0",
     lifespan=lifespan
 )
@@ -239,7 +246,7 @@ async def status():
     now = datetime.now()
     response_text = f"""
 ---------------------------------------------
-An I/O Link - elCamilet.com
+An I/O Link - io.elCamilet.com
 
 Transferencia P2P sin almacenamiento en servidor
 
@@ -251,6 +258,91 @@ Enlaces activos: {len(active_bridges)}
     else:
         response_text += "\n"
     return PlainTextResponse(content=response_text.strip())
+
+
+@app.get("/{token}/info")
+async def get_file_info(token: str):
+    """Devuelve metadatos del archivo (nombre, tamaño) para mostrar al receptor antes de descargar."""
+    if token not in active_bridges:
+        raise HTTPException(status_code=404, detail="Token no encontrado")
+    bridge = active_bridges[token]
+    if bridge.ws_metadata is None:
+        raise HTTPException(status_code=404, detail="Metadatos no disponibles aún")
+    return bridge.ws_metadata
+
+
+@app.websocket("/{token}/signal")
+async def webrtc_signal(ws: WebSocket, token: str):
+    """Servidor de señalización WebRTC: relay de mensajes SDP e ICE entre peers."""
+    if token not in active_bridges:
+        await ws.close(code=4004)
+        return
+
+    bridge = active_bridges[token]
+    await ws.accept()
+
+    role = None
+    peer_ready = False
+    async with bridge.signal_lock:
+        if bridge.up_ws is None:
+            bridge.up_ws = ws
+            role = "up"
+            peer_ready = bridge.down_ws is not None
+        elif bridge.down_ws is None:
+            bridge.down_ws = ws
+            role = "down"
+            peer_ready = bridge.up_ws is not None
+        else:
+            await ws.close(code=4003)
+            return
+
+    # Notificar a ambos si el peer ya estaba esperando
+    if peer_ready:
+        other = bridge.down_ws if role == "up" else bridge.up_ws
+        try:
+            await other.send_json({"type": "peer_connected"})
+            await ws.send_json({"type": "peer_connected"})
+        except Exception as e:
+            logger.error(f"Signal notify error ({role}): {e}")
+
+    def get_peer():
+        return bridge.down_ws if role == "up" else bridge.up_ws
+
+    logger.info(f"Signal WS connected: {role} for token {token}")
+    try:
+        while True:
+            data = await ws.receive_text()
+            # Extraer metadatos si el emisor los manda (para endpoint /info)
+            try:
+                msg = json.loads(data)
+                if msg.get("type") == "metadata" and role == "up":
+                    bridge.ws_metadata = msg
+            except (json.JSONDecodeError, TypeError):
+                pass
+            # Relay al peer
+            peer = get_peer()
+            if peer is not None:
+                try:
+                    await peer.send_text(data)
+                except Exception:
+                    break
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.error(f"Signal WS error ({role}): {e}")
+    finally:
+        async with bridge.signal_lock:
+            if role == "up":
+                bridge.up_ws = None
+            elif role == "down":
+                bridge.down_ws = None
+        peer = get_peer()
+        if peer:
+            try:
+                await peer.send_json({"type": "peer_disconnected"})
+            except Exception:
+                pass
+        logger.info(f"Signal WS closed: {role} for token {token}")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info", timeout_keep_alive=3600)
