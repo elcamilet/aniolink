@@ -113,6 +113,21 @@ function App() {
               await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
             } else if (msg.type === 'peer_disconnected') {
               reject(new Error('El receptor se desconectó antes de completar la transferencia'));
+            } else if (msg.type === 'curl_download_connected') {
+              // El receptor es curl: saltar WebRTC y subir el archivo via HTTP PUT
+              setUploadStatus('Receptor curl conectado. Enviando archivo...');
+              try {
+                const file = selectedFile;
+                const metadata = { type: 'metadata', name: file.name, size: file.size, mime: file.type || 'application/octet-stream' };
+                if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(metadata));
+                const resp = await fetch(
+                  `${API_BASE_URL}/${newToken}/${encodeURIComponent(file.name)}`,
+                  { method: 'PUT', body: file, headers: { 'Content-Type': file.type || 'application/octet-stream', 'Content-Length': String(file.size) } }
+                );
+                if (!resp.ok) throw new Error(`Error HTTP ${resp.status}`);
+                setUploadStatus('¡Archivo transferido con éxito!');
+                resolve();
+              } catch (e) { reject(e); }
             }
           } catch (e) { reject(e); }
         };
@@ -164,7 +179,10 @@ function App() {
       setTimeout(() => setUploadStatus(''), 5000);
     } finally {
       if (ws && ws.readyState === WebSocket.OPEN) ws.close();
-      if (pc) pc.close();
+      // Retrasar pc.close() para que los chunks en tránsito lleguen al receptor
+      // antes de cerrar el transporte ICE/DTLS/SCTP subyacente.
+      const pcRef = pc;
+      setTimeout(() => { try { pcRef?.close(); } catch (_) {} }, 8000);
       setIsUploading(false);
     }
   };
@@ -201,6 +219,29 @@ function App() {
         let receivedSize = 0;
         const iceBuf = [];
         let remoteSet = false;
+        // Flag en el scope de la promesa: impide que errores post-transferencia llamen a reject
+        let transferComplete = false;
+
+        const triggerDownload = () => {
+          if (transferComplete) return;
+          transferComplete = true;
+          setDownloadProgress(100);
+          setDownloadStatus('¡Descarga completada!');
+          resolve();
+          // setTimeout(0): da tiempo a React a renderizar el 100% antes de abrir el diálogo nativo
+          const blob = new Blob(chunks, { type: metadata?.mime || 'application/octet-stream' });
+          const url = URL.createObjectURL(blob);
+          setTimeout(() => {
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = metadata?.name || 'archivo';
+            a.style.display = 'none';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(url), 60000);
+          }, 0);
+        };
 
         ws.onmessage = async (event) => {
           try {
@@ -220,9 +261,54 @@ function App() {
               if (remoteSet) await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
               else iceBuf.push(msg.candidate);
             } else if (msg.type === 'peer_disconnected') {
-              reject(new Error('El emisor se desconectó'));
+              if (!transferComplete) reject(new Error('El emisor se desconectó'));
+            } else if (msg.type === 'http_upload_available') {
+              // El emisor es curl/terminal: descargar via HTTP GET en lugar de WebRTC
+              setDownloadStatus(`Recibiendo de terminal: ${msg.filename || 'archivo'}...`);
+              const totalSize = msg.size || 0;
+              (async () => {
+                try {
+                  const resp = await fetch(`${API_BASE_URL}/${tok}?dl=1`);
+                  if (!resp.ok) throw new Error(`Error HTTP ${resp.status}`);
+                  const contentDisp = resp.headers.get('Content-Disposition') || '';
+                  const fnMatch = contentDisp.match(/filename="?([^"]+)"?/);
+                  const filename = fnMatch ? fnMatch[1] : (msg.filename || 'archivo');
+                  const reader = resp.body.getReader();
+                  const httpChunks = [];
+                  let received = 0;
+                  while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    httpChunks.push(value);
+                    received += value.length;
+                    if (totalSize > 0) {
+                      const pct = Math.round((received / totalSize) * 100);
+                      setDownloadProgress(Math.min(99, pct));
+                      setDownloadStatus(`Descargando... ${Math.min(99, pct)}%`);
+                    } else {
+                      setDownloadStatus(`Descargando... ${(received / 1024 / 1024).toFixed(1)} MB`);
+                    }
+                  }
+                  transferComplete = true;
+                  setDownloadProgress(100);
+                  setDownloadStatus('¡Descarga completada!');
+                  resolve();
+                  const blob = new Blob(httpChunks, { type: resp.headers.get('Content-Type') || 'application/octet-stream' });
+                  const url = URL.createObjectURL(blob);
+                  setTimeout(() => {
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = filename;
+                    a.style.display = 'none';
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    setTimeout(() => URL.revokeObjectURL(url), 60000);
+                  }, 0);
+                } catch (e) { if (!transferComplete) reject(e); }
+              })();
             }
-          } catch (e) { reject(e); }
+          } catch (e) { if (!transferComplete) reject(e); }
         };
 
         pc.ondatachannel = (event) => {
@@ -231,47 +317,42 @@ function App() {
 
           dc.onmessage = (evt) => {
             if (typeof evt.data === 'string') {
-              const msg = JSON.parse(evt.data);
-              if (msg.type === 'metadata') {
-                metadata = msg;
-                setDownloadStatus(`Recibiendo: ${metadata.name}`);
+              if (!transferComplete) {
+                const msg = JSON.parse(evt.data);
+                if (msg.type === 'metadata') {
+                  metadata = msg;
+                  setDownloadStatus(`Recibiendo: ${metadata.name}`);
+                }
               }
             } else {
+              if (transferComplete) return; // ignorar chunks tardíos post-triggerDownload
               chunks.push(evt.data);
               receivedSize += evt.data.byteLength;
               if (metadata?.size > 0) {
                 const pct = Math.round((receivedSize / metadata.size) * 100);
                 setDownloadProgress(pct);
                 setDownloadStatus(`Descargando... ${pct}%`);
+                if (receivedSize >= metadata.size) {
+                  triggerDownload();
+                }
               } else {
                 setDownloadStatus(`Descargando... ${(receivedSize / 1024 / 1024).toFixed(1)} MB`);
               }
             }
           };
 
-          dc.onclose = () => {
-            const blob = new Blob(chunks, { type: metadata?.mime || 'application/octet-stream' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = metadata?.name || 'archivo';
-            a.style.display = 'none';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            setTimeout(() => URL.revokeObjectURL(url), 60000);
-            setDownloadStatus('¡Descarga completada!');
-            resolve();
-          };
-
-          dc.onerror = () => reject(new Error('Error en el canal de datos P2P'));
+          // Fallback para archivos sin tamaño conocido o si onmessage no alcanzó el total
+          dc.onclose = () => triggerDownload();
+          // Solo reportar error si la transferencia no había terminado
+          dc.onerror = () => { if (!transferComplete) reject(new Error('Error en el canal de datos P2P')); };
         };
 
         pc.onconnectionstatechange = () => {
-          if (pc.connectionState === 'failed') reject(new Error('Conexión WebRTC fallida'));
+          if (pc.connectionState === 'failed' && !transferComplete)
+            reject(new Error('Conexión WebRTC fallida'));
         };
-        ws.onerror = () => reject(new Error('Error de WebSocket'));
-        setTimeout(() => reject(new Error('Tiempo de espera agotado')), 600000);
+        ws.onerror = () => { if (!transferComplete) reject(new Error('Error de WebSocket')); };
+        setTimeout(() => { if (!transferComplete) reject(new Error('Tiempo de espera agotado')); }, 600000);
       });
 
       setTimeout(() => {
@@ -384,7 +465,7 @@ function App() {
               <h3 className="text-lg font-medium text-gray-300 mb-3">1. Generar un token:</h3>
               <div className="bg-black rounded-lg p-4 font-mono text-sm mb-2">
                 <div className="flex items-center mb-2">
-                  <span className="text-green-400">user@linux:~$</span>
+                  <span className="text-green-400">{"#>"}</span>
                   <span className="text-white ml-2">curl {API_BASE_URL}/token</span>
                 </div>
                 <div className="text-gray-300 text-xs">
@@ -400,7 +481,7 @@ function App() {
               <h3 className="text-lg font-medium text-gray-300 mb-3">2. Enviar un archivo:</h3>
               <div className="bg-black rounded-lg p-4 font-mono text-sm mb-2">
                 <div className="flex items-center mb-2">
-                  <span className="text-green-400">user@linux:~$</span>
+                  <span className="text-green-400">{"#>"}</span>
                   <span className="text-white ml-2">curl --upload-file FILE {API_BASE_URL}/abc4/</span>
                 </div>
               </div>
@@ -412,7 +493,7 @@ function App() {
               <h3 className="text-lg font-medium text-gray-300 mb-3">3. Recibir el archivo:</h3>
               <div className="bg-black rounded-lg p-4 font-mono text-sm mb-2">
                 <div className="flex items-center mb-2">
-                  <span className="text-green-400">user@linux:~$</span>
+                  <span className="text-green-400">{"#>"}</span>
                   <span className="text-white ml-2">curl -O -J {API_BASE_URL}/abc4</span>
                 </div>
               </div>

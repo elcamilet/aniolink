@@ -57,6 +57,7 @@ class P2PBridge:
         self.down_ws: Optional[WebSocket] = None
         self.signal_lock = asyncio.Lock()
         self.ws_metadata: Optional[dict] = None
+        self.http_upload = False  # True si el emisor usa HTTP PUT (curl/terminal)
         
     def set_upload_info(self, stream, filename, content_type, content_length):
         self.upload_stream = stream
@@ -188,6 +189,14 @@ async def upload_p2p(token: str, filename: str, request: Request):
             content_type = guessed_type
 
     bridge.set_upload_info(request.stream(), original_filename, content_type, content_length)
+    bridge.http_upload = True
+    # Si hay un receptor browser esperando via WebSocket, avisarle que el emisor es curl/terminal
+    size = int(content_length) if content_length else None
+    for ws_client in filter(None, [bridge.up_ws, bridge.down_ws]):
+        try:
+            await ws_client.send_json({"type": "http_upload_available", "filename": original_filename, "size": size})
+        except Exception as e:
+            logger.warning(f"No se pudo notificar al receptor del upload HTTP: {e}")
     logger.info(f"Subida preparada: {original_filename} - esperando la descarga")
     try:
         await asyncio.wait_for(bridge.download_ready.wait(), timeout=TIMEOUT_SECONDS)
@@ -223,6 +232,12 @@ async def download_p2p(token: str, request: Request, dl: Optional[str] = Query(N
 
     bridge = active_bridges[token]
     bridge.download_connected.set()
+    # Si hay un emisor browser esperando por WebSocket, avisarle que el receptor es curl
+    if bridge.up_ws is not None:
+        try:
+            await bridge.up_ws.send_json({"type": "curl_download_connected"})
+        except Exception as e:
+            logger.warning(f"No se pudo notificar al emisor del receptor curl: {e}")
     try:
         await asyncio.wait_for(bridge.upload_ready.wait(), timeout=TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
@@ -304,6 +319,13 @@ async def webrtc_signal(ws: WebSocket, token: str):
             await ws.send_json({"type": "peer_connected"})
         except Exception as e:
             logger.error(f"Signal notify error ({role}): {e}")
+    elif bridge.http_upload and bridge.upload_ready.is_set():
+        # El emisor es curl/terminal (no WebSocket): notificar a este receptor browser
+        try:
+            size = int(bridge.content_length) if bridge.content_length else None
+            await ws.send_json({"type": "http_upload_available", "filename": bridge.filename, "size": size})
+        except Exception as e:
+            logger.error(f"Signal notify error (http_upload_available): {e}")
 
     def get_peer():
         return bridge.down_ws if role == "up" else bridge.up_ws
