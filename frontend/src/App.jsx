@@ -154,6 +154,10 @@ function App() {
               offset += buf.byteLength;
               setUploadStatus(`Transfiriendo... ${Math.round((offset / file.size) * 100)}%`);
             }
+            while (dc.bufferedAmount > 0) {
+              await new Promise(r => setTimeout(r, 20));
+            }
+            dc.send(JSON.stringify({ type: 'eof', size: file.size }));
             dc.close();
             setUploadStatus('¡Archivo transferido con éxito!');
             resolve();
@@ -217,6 +221,7 @@ function App() {
         let metadata = null;
         const chunks = [];
         let receivedSize = 0;
+        let eofReceived = false;
         const iceBuf = [];
         let remoteSet = false;
         // Flag en el scope de la promesa: impide que errores post-transferencia llamen a reject
@@ -318,10 +323,19 @@ function App() {
           dc.onmessage = (evt) => {
             if (typeof evt.data === 'string') {
               if (!transferComplete) {
-                const msg = JSON.parse(evt.data);
-                if (msg.type === 'metadata') {
-                  metadata = msg;
-                  setDownloadStatus(`Recibiendo: ${metadata.name}`);
+                try {
+                  const msg = JSON.parse(evt.data);
+                  if (msg.type === 'metadata') {
+                    metadata = msg;
+                    setDownloadStatus(`Recibiendo: ${metadata.name}`);
+                  } else if (msg.type === 'eof') {
+                    eofReceived = true;
+                    if (!metadata?.size || receivedSize >= metadata.size || receivedSize >= (msg.size || 0)) {
+                      triggerDownload();
+                    }
+                  }
+                } catch (_) {
+                  // Ignorar mensajes de control no JSON
                 }
               }
             } else {
@@ -341,8 +355,15 @@ function App() {
             }
           };
 
-          // Fallback para archivos sin tamaño conocido o si onmessage no alcanzó el total
-          dc.onclose = () => triggerDownload();
+          // Solo finalizar en onclose si hay evidencia de transferencia completa.
+          dc.onclose = () => {
+            if (transferComplete) return;
+            if (eofReceived || (metadata?.size > 0 && receivedSize >= metadata.size) || (!metadata?.size && receivedSize > 0)) {
+              triggerDownload();
+              return;
+            }
+            reject(new Error('Transferencia incompleta: el canal se cerró antes de recibir datos'));
+          };
           // Solo reportar error si la transferencia no había terminado
           dc.onerror = () => { if (!transferComplete) reject(new Error('Error en el canal de datos P2P')); };
         };

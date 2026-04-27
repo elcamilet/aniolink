@@ -10,7 +10,7 @@ import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from string import Template
-from typing import Dict, Optional
+from typing import Annotated, Any, Dict, Optional
 from urllib.parse import unquote
 from contextlib import asynccontextmanager
 
@@ -18,6 +18,7 @@ from fastapi import FastAPI, Request, HTTPException, Query, WebSocket, WebSocket
 from fastapi.responses import StreamingResponse, PlainTextResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import uvicorn
 from dotenv import load_dotenv
 
@@ -25,10 +26,9 @@ load_dotenv()
 
 HOST = '0.0.0.0'
 PORT = int(os.getenv('PORT', 3000))
-# PUBLIC_HOST = os.getenv('PUBLIC_HOST', 'p2p.example.com')
-PUBLIC_HOST = os.getenv('PUBLIC_HOST', '192.168.1.98')
+PUBLIC_HOST = os.getenv('PUBLIC_HOST', 'io.example.com')
 TOKEN_LENGTH = int(os.getenv('TOKEN_LENGTH', 4))
-TIMEOUT_SECONDS = int(os.getenv('TIMEOUT_SECONDS', 3600))  # 1 hora para archivos grandes
+TIMEOUT_SECONDS = int(os.getenv('TIMEOUT_SECONDS', 600))
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
@@ -36,7 +36,23 @@ logger = logging.getLogger(__name__)
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 DOWNLOAD_TEMPLATE = Template((TEMPLATES_DIR / "download.html").read_text(encoding="utf-8"))
 
-active_bridges: Dict[str, dict] = {}
+class TokenStatusResponse(BaseModel):
+    ready: bool
+    waiting_since: str | None = None
+    error: str | None = None
+
+
+active_bridges: Dict[str, "P2PBridge"] = {}
+
+
+def parse_content_length(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
 
 class P2PBridge:
     def __init__(self, token: str):
@@ -49,9 +65,11 @@ class P2PBridge:
         self.upload_stream = None
         self.filename = "file.bin"
         self.content_type = 'application/octet-stream'
-        self.content_length = None
+        self.content_length: int | None = None
         self.created = datetime.now()
         self.transfer_complete = asyncio.Event()
+        self.transfer_error: str | None = None
+        self.bytes_transferred = 0
         # WebRTC signaling
         self.up_ws: Optional[WebSocket] = None
         self.down_ws: Optional[WebSocket] = None
@@ -59,11 +77,19 @@ class P2PBridge:
         self.ws_metadata: Optional[dict] = None
         self.http_upload = False  # True si el emisor usa HTTP PUT (curl/terminal)
         
-    def set_upload_info(self, stream, filename, content_type, content_length):
+    def set_upload_info(
+        self,
+        stream: Any,
+        filename: str,
+        content_type: str,
+        content_length: int | None,
+    ) -> None:
         self.upload_stream = stream
         self.filename = filename
         self.content_type = content_type
         self.content_length = content_length
+        self.transfer_error = None
+        self.bytes_transferred = 0
         if hasattr(stream, 'seek'):
             stream.seek(0)
         self.upload_ready.set()
@@ -84,15 +110,24 @@ class P2PBridge:
                     chunk = self.upload_stream.read(chunk_size)
                     if not chunk:
                         break
+                    self.bytes_transferred += len(chunk)
                     yield chunk
             else:
                 async for chunk in self.upload_stream:
-                    if chunk:
-                        yield chunk
+                    if not chunk:
+                        continue
+                    self.bytes_transferred += len(chunk)
+                    yield chunk
         except Exception as e:
             logger.error(f"P2P stream error: {e}")
             raise
         finally:
+            if self.content_length is not None and self.bytes_transferred != self.content_length:
+                self.transfer_error = (
+                    f"Transferencia incompleta: esperados {self.content_length} bytes, "
+                    f"enviados {self.bytes_transferred} bytes"
+                )
+                logger.error(self.transfer_error)
             self.transfer_complete.set()
             logger.info(f"P2P transfer complete: {self.filename}")
 
@@ -146,7 +181,7 @@ app.add_middleware(
 
 
 @app.get("/token")
-async def create_token():
+async def create_token() -> PlainTextResponse:
     cleanup_expired()
     token = generate_token()
     active_bridges[token] = P2PBridge(token)
@@ -163,14 +198,14 @@ RECIBIR: curl -O -J https://{PUBLIC_HOST}/{token}
     return PlainTextResponse(content=response_text.strip())
 
 @app.get("/{token}/status")
-async def check_token_status(token: str):
+async def check_token_status(token: str) -> TokenStatusResponse:
     if token not in active_bridges:
-        return {"ready": False, "error": "Token no encontrado"}
+        return TokenStatusResponse(ready=False, error="Token no encontrado")
     bridge = active_bridges[token]
-    return {
-        "ready": bridge.download_connected.is_set() and not bridge.stream_started.is_set(),
-        "waiting_since": bridge.created.isoformat()
-    }
+    return TokenStatusResponse(
+        ready=bridge.download_connected.is_set() and not bridge.stream_started.is_set(),
+        waiting_since=bridge.created.isoformat(),
+    )
 
 @app.put("/{token}/{filename:path}")
 async def upload_p2p(token: str, filename: str, request: Request):
@@ -180,7 +215,7 @@ async def upload_p2p(token: str, filename: str, request: Request):
     bridge = active_bridges[token]
     original_filename = extract_filename(filename)
     content_type = request.headers.get('content-type', 'application/octet-stream')
-    content_length = request.headers.get('content-length')
+    content_length = parse_content_length(request.headers.get('content-length'))
 
     # Detectar el content type real por nombre de fichero si no se especifica
     if content_type == 'application/octet-stream':
@@ -191,7 +226,7 @@ async def upload_p2p(token: str, filename: str, request: Request):
     bridge.set_upload_info(request.stream(), original_filename, content_type, content_length)
     bridge.http_upload = True
     # Si hay un receptor browser esperando via WebSocket, avisarle que el emisor es curl/terminal
-    size = int(content_length) if content_length else None
+    size = content_length
     for ws_client in filter(None, [bridge.up_ws, bridge.down_ws]):
         try:
             await ws_client.send_json({"type": "http_upload_available", "filename": original_filename, "size": size})
@@ -201,6 +236,8 @@ async def upload_p2p(token: str, filename: str, request: Request):
     try:
         await asyncio.wait_for(bridge.download_ready.wait(), timeout=TIMEOUT_SECONDS)
         await bridge.transfer_complete.wait()
+        if bridge.transfer_error is not None:
+            raise HTTPException(status_code=502, detail=bridge.transfer_error)
         response_text = f"""
 ---------------------------------------------
 Transferencia completada con ÉXITO!
@@ -213,7 +250,11 @@ Transferencia completada con ÉXITO!
         active_bridges.pop(token, None)
 
 @app.get("/{token}")
-async def download_p2p(token: str, request: Request, dl: Optional[str] = Query(None)):
+async def download_p2p(
+    token: str,
+    request: Request,
+    dl: Annotated[str | None, Query()] = None,
+):
     accept = request.headers.get("accept", "")
     is_browser = "text/html" in accept and dl is None
 
@@ -246,8 +287,9 @@ async def download_p2p(token: str, request: Request, dl: Optional[str] = Query(N
     headers = {
         'Content-Disposition': f'attachment; filename="{bridge.filename}"',
         'Cache-Control': 'no-cache',
-        'Transfer-Encoding': 'chunked'  # Indica que usaremos streaming sin Content-Length
     }
+    if bridge.content_length is not None:
+        headers['Content-Length'] = str(bridge.content_length)
     logger.info(f"Descarga conectada: {bridge.filename} - comenzando stream P2P")
     return StreamingResponse(
         bridge.stream_direct_p2p(),
@@ -256,7 +298,7 @@ async def download_p2p(token: str, request: Request, dl: Optional[str] = Query(N
     )
 
 @app.get("/status/")
-async def status():
+async def status() -> PlainTextResponse:
     cleanup_expired()
     now = datetime.now()
     response_text = f"""
@@ -276,7 +318,7 @@ Enlaces activos: {len(active_bridges)}
 
 
 @app.get("/{token}/info")
-async def get_file_info(token: str):
+async def get_file_info(token: str) -> dict:
     """Devuelve metadatos del archivo (nombre, tamaño) para mostrar al receptor antes de descargar."""
     if token not in active_bridges:
         raise HTTPException(status_code=404, detail="Token no encontrado")
@@ -322,7 +364,7 @@ async def webrtc_signal(ws: WebSocket, token: str):
     elif bridge.http_upload and bridge.upload_ready.is_set():
         # El emisor es curl/terminal (no WebSocket): notificar a este receptor browser
         try:
-            size = int(bridge.content_length) if bridge.content_length else None
+            size = bridge.content_length
             await ws.send_json({"type": "http_upload_available", "filename": bridge.filename, "size": size})
         except Exception as e:
             logger.error(f"Signal notify error (http_upload_available): {e}")

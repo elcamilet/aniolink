@@ -60,3 +60,6 @@ Thumbs.db
 # Custom
 NOTES.txt
 .github/
+.claude/
+.agents/
+skills-lock.json
