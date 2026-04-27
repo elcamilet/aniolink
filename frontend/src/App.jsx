@@ -99,6 +99,53 @@ function App() {
 
       // 4. Esperar peer, señalizar y transferir
       await new Promise((resolve, reject) => {
+        let transferComplete = false;
+        const MAX_BUFFERED_AMOUNT = 2 * 1024 * 1024;
+        const LOW_WATERMARK = 512 * 1024;
+        dc.bufferedAmountLowThreshold = LOW_WATERMARK;
+
+        const waitForBufferedDrain = () => new Promise((drainResolve, drainReject) => {
+          if (transferComplete || dc.bufferedAmount <= LOW_WATERMARK) {
+            drainResolve();
+            return;
+          }
+
+          let settled = false;
+          const cleanup = () => {
+            dc.removeEventListener('bufferedamountlow', onLow);
+            dc.removeEventListener('close', onClose);
+            dc.removeEventListener('error', onError);
+          };
+          const settleResolve = () => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            drainResolve();
+          };
+          const settleReject = (err) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            drainReject(err);
+          };
+          const onLow = () => settleResolve();
+          const onClose = () => {
+            if (transferComplete) settleResolve();
+            else settleReject(new Error('Canal P2P cerrado durante la transferencia'));
+          };
+          const onError = () => {
+            if (transferComplete) settleResolve();
+            else settleReject(new Error('Error en el canal de datos P2P'));
+          };
+
+          dc.addEventListener('bufferedamountlow', onLow);
+          dc.addEventListener('close', onClose);
+          dc.addEventListener('error', onError);
+
+          // Fallback si el evento bufferedamountlow se retrasa al ir en segundo plano
+          setTimeout(() => settleResolve(), 1500);
+        });
+
         ws.onmessage = async (event) => {
           try {
             const msg = JSON.parse(event.data);
@@ -144,31 +191,36 @@ function App() {
             // Enviar archivo en chunks con control de flujo (backpressure)
             const CHUNK = 64 * 1024;
             let offset = 0;
+            let lastUiUpdate = 0;
             while (offset < file.size) {
-              while (dc.bufferedAmount > 2 * 1024 * 1024) {
-                await new Promise(r => setTimeout(r, 30));
+              while (dc.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+                await waitForBufferedDrain();
               }
               const slice = file.slice(offset, Math.min(offset + CHUNK, file.size));
               const buf = await slice.arrayBuffer();
               dc.send(buf);
               offset += buf.byteLength;
-              setUploadStatus(`Transfiriendo... ${Math.round((offset / file.size) * 100)}%`);
+              const now = Date.now();
+              if (offset === file.size || now - lastUiUpdate > 120) {
+                setUploadStatus(`Transfiriendo... ${Math.round((offset / file.size) * 100)}%`);
+                lastUiUpdate = now;
+              }
             }
             while (dc.bufferedAmount > 0) {
-              await new Promise(r => setTimeout(r, 20));
+              await waitForBufferedDrain();
             }
             dc.send(JSON.stringify({ type: 'eof', size: file.size }));
-            dc.close();
+            transferComplete = true;
             setUploadStatus('¡Archivo transferido con éxito!');
             resolve();
           } catch (e) { reject(e); }
         };
 
-        dc.onerror = () => reject(new Error('Error en el canal de datos P2P'));
+        dc.onerror = () => { if (!transferComplete) reject(new Error('Error en el canal de datos P2P')); };
         pc.onconnectionstatechange = () => {
-          if (pc.connectionState === 'failed') reject(new Error('Conexión WebRTC fallida'));
+          if (pc.connectionState === 'failed' && !transferComplete) reject(new Error('Conexión WebRTC fallida'));
         };
-        ws.onerror = () => reject(new Error('Error de WebSocket'));
+        ws.onerror = () => { if (!transferComplete) reject(new Error('Error de WebSocket')); };
       });
 
       setTimeout(() => {
