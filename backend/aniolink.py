@@ -38,14 +38,14 @@ DOWNLOAD_TEMPLATE = Template((TEMPLATES_DIR / "download.html").read_text(encodin
 
 class TokenStatusResponse(BaseModel):
     ready: bool
-    waiting_since: str | None = None
-    error: str | None = None
+    waiting_since: Optional[str] = None
+    error: Optional[str] = None
 
 
 active_bridges: Dict[str, "P2PBridge"] = {}
 
 
-def parse_content_length(value: str | None) -> int | None:
+def parse_content_length(value: Optional[str]) -> Optional[int]:
     if value is None:
         return None
     try:
@@ -65,10 +65,10 @@ class P2PBridge:
         self.upload_stream = None
         self.filename = "file.bin"
         self.content_type = 'application/octet-stream'
-        self.content_length: int | None = None
+        self.content_length: Optional[int] = None
         self.created = datetime.now()
         self.transfer_complete = asyncio.Event()
-        self.transfer_error: str | None = None
+        self.transfer_error: Optional[str] = None
         self.bytes_transferred = 0
         # WebRTC signaling
         self.up_ws: Optional[WebSocket] = None
@@ -82,7 +82,7 @@ class P2PBridge:
         stream: Any,
         filename: str,
         content_type: str,
-        content_length: int | None,
+        content_length: Optional[int],
     ) -> None:
         self.upload_stream = stream
         self.filename = filename
@@ -253,7 +253,7 @@ Transferencia completada con ÉXITO!
 async def download_p2p(
     token: str,
     request: Request,
-    dl: Annotated[str | None, Query()] = None,
+    dl: Annotated[Optional[str], Query()] = None,
 ):
     accept = request.headers.get("accept", "")
     is_browser = "text/html" in accept and dl is None
