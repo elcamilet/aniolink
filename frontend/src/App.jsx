@@ -206,8 +206,9 @@ function App() {
                 lastUiUpdate = now;
               }
             }
-            while (dc.bufferedAmount > 0) {
-              await waitForBufferedDrain();
+            const flushDeadline = Date.now() + 5000;
+            while (dc.bufferedAmount > 0 && dc.readyState === 'open' && Date.now() < flushDeadline) {
+              await new Promise((r) => setTimeout(r, 20));
             }
             dc.send(JSON.stringify({ type: 'eof', size: file.size }));
             transferComplete = true;
