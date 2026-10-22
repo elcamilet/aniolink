@@ -1,0 +1,59 @@
+# Paths that never count as code the wiki should cover. Git pathspecs, one per line.
+# A plain `*` also crosses directories here: `*.md` matches README.md and docs/a/b.md alike.
+# A line starting with `!` brings paths back, whatever order it appears in: `!docs/adr/**`.
+#
+# This is a starting point. The first wikipoke-ingest pass tailors it to this repository:
+# tests, generated files, fixtures and build plumbing usually belong here. Ignoring something is a
+# conscious call; coverage keeps listing whatever is neither ignored nor documented.
+
+# the wiki itself, documentation and agent configuration
+wiki/**
+.wikipoke.json
+*.md
+# ...but in a repository whose product is prose - prompts, skills, agent instructions, a spec -
+# that Markdown IS the code, and a `!` line brings it back:
+#   !prompts/**
+.agents/**
+.claude/**
+.codex/**
+.cursor/**
+.opencode/**
+.github/**
+
+# lockfiles
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+bun.lockb
+composer.lock
+Cargo.lock
+Gemfile.lock
+poetry.lock
+uv.lock
+go.sum
+
+# repository plumbing
+.gitignore
+.gitattributes
+.editorconfig
+.npmrc
+.nvmrc
+
+# tests: covered at the flow level, not file by file
+backend/tests/**
+
+# frontend build plumbing and static assets
+frontend/index.html
+frontend/package.json
+frontend/*.config.js
+frontend/public/**
+frontend/src/index.css
+
+# backend dependency manifests (mentioned in architecture)
+backend/requirements.txt
+backend/requirements-dev.txt
+
+# specs, plans and legal/bootstrapping files
+openspec/**
+LICENSE
+.env.example
