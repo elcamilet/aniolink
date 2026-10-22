@@ -10,6 +10,55 @@ const ICE_SERVERS = {
   ],
 };
 
+const LARGE_FILE_THRESHOLD = 1024 * 1024 * 1024;
+const IDLE_TIMEOUT_MS = 60000;
+const READY_TIMEOUT_MS = 300000;
+const ACK_TIMEOUT_MS = 120000;
+
+const supportsFileSystemAccess = () =>
+  typeof window !== 'undefined' && typeof window.showSaveFilePicker === 'function';
+
+const withTimeout = (promise, ms, message) =>
+  Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms)),
+  ]);
+
+async function openDiskWriter(filename) {
+  if (!supportsFileSystemAccess()) return null;
+  try {
+    const handle = await window.showSaveFilePicker({ suggestedName: filename || 'archivo' });
+    return await handle.createWritable();
+  } catch (error) {
+    if (error && error.name === 'AbortError') throw error;
+    return null;
+  }
+}
+
+function saveBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  setTimeout(() => {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename || 'archivo';
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  }, 0);
+}
+
+function startNativeDownload(url, filename) {
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename || '';
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
 function App() {
   const [selectedFile, setSelectedFile] = useState(null);
   const [token, setToken] = useState('');
@@ -90,6 +139,7 @@ function App() {
       // 3. Crear RTCPeerConnection con DataChannel
       pc = new RTCPeerConnection(ICE_SERVERS);
       const dc = pc.createDataChannel('file', { ordered: true });
+      dc.binaryType = 'arraybuffer';
 
       pc.onicecandidate = ({ candidate }) => {
         if (candidate && ws.readyState === WebSocket.OPEN) {
@@ -100,9 +150,24 @@ function App() {
       // 4. Esperar peer, señalizar y transferir
       await new Promise((resolve, reject) => {
         let transferComplete = false;
+        let readyResolve;
+        let ackResolve;
+        const readyPromise = new Promise((res) => { readyResolve = res; });
+        const ackPromise = new Promise((res) => { ackResolve = res; });
         const MAX_BUFFERED_AMOUNT = 2 * 1024 * 1024;
         const LOW_WATERMARK = 512 * 1024;
         dc.bufferedAmountLowThreshold = LOW_WATERMARK;
+
+        dc.onmessage = (event) => {
+          if (typeof event.data !== 'string') return;
+          try {
+            const msg = JSON.parse(event.data);
+            if (msg.type === 'ready') readyResolve();
+            else if (msg.type === 'ack') ackResolve(msg);
+          } catch (_) {
+            // Ignorar mensajes de control no JSON
+          }
+        };
 
         const waitForBufferedDrain = () => new Promise((drainResolve, drainReject) => {
           if (transferComplete || dc.bufferedAmount <= LOW_WATERMARK) {
@@ -111,10 +176,12 @@ function App() {
           }
 
           let settled = false;
+          let interval = null;
           const cleanup = () => {
             dc.removeEventListener('bufferedamountlow', onLow);
             dc.removeEventListener('close', onClose);
             dc.removeEventListener('error', onError);
+            if (interval) clearInterval(interval);
           };
           const settleResolve = () => {
             if (settled) return;
@@ -129,21 +196,16 @@ function App() {
             drainReject(err);
           };
           const onLow = () => settleResolve();
-          const onClose = () => {
-            if (transferComplete) settleResolve();
-            else settleReject(new Error('Canal P2P cerrado durante la transferencia'));
-          };
-          const onError = () => {
-            if (transferComplete) settleResolve();
-            else settleReject(new Error('Error en el canal de datos P2P'));
-          };
+          const onClose = () => settleReject(new Error('Canal P2P cerrado durante la transferencia'));
+          const onError = () => settleReject(new Error('Error en el canal de datos P2P'));
 
           dc.addEventListener('bufferedamountlow', onLow);
           dc.addEventListener('close', onClose);
           dc.addEventListener('error', onError);
-
-          // Fallback si el evento bufferedamountlow se retrasa al ir en segundo plano
-          setTimeout(() => settleResolve(), 1500);
+          // Reintento periódico: solo resuelve si el buffer realmente bajó.
+          interval = setInterval(() => {
+            if (transferComplete || dc.bufferedAmount <= LOW_WATERMARK) settleResolve();
+          }, 250);
         });
 
         ws.onmessage = async (event) => {
@@ -169,7 +231,7 @@ function App() {
                 if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(metadata));
                 const resp = await fetch(
                   `${API_BASE_URL}/${newToken}/${encodeURIComponent(file.name)}`,
-                  { method: 'PUT', body: file, headers: { 'Content-Type': file.type || 'application/octet-stream', 'Content-Length': String(file.size) } }
+                  { method: 'PUT', body: file, headers: { 'Content-Type': file.type || 'application/octet-stream' } }
                 );
                 if (!resp.ok) throw new Error(`Error HTTP ${resp.status}`);
                 setUploadStatus('¡Archivo transferido con éxito!');
@@ -183,13 +245,20 @@ function App() {
           try {
             setUploadStatus('Conexión P2P directa establecida. Transfiriendo...');
             const file = selectedFile;
-            // Enviar metadatos al servidor (para endpoint /info) y al peer via DataChannel
             const metadata = { type: 'metadata', name: file.name, size: file.size, mime: file.type || 'application/octet-stream' };
             if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(metadata));
             dc.send(JSON.stringify(metadata));
 
+            // El receptor confirma que ya puede guardar antes de enviar datos
+            try {
+              await withTimeout(readyPromise, READY_TIMEOUT_MS, 'El receptor no confirmó que está listo para guardar el archivo');
+            } catch (e) {
+              reject(e);
+              return;
+            }
+
             // Enviar archivo en chunks con control de flujo (backpressure)
-            const CHUNK = 64 * 1024;
+            const CHUNK = 16 * 1024;
             let offset = 0;
             let lastUiUpdate = 0;
             while (offset < file.size) {
@@ -202,21 +271,27 @@ function App() {
               offset += buf.byteLength;
               const now = Date.now();
               if (offset === file.size || now - lastUiUpdate > 120) {
-                setUploadStatus(`Transfiriendo... ${Math.round((offset / file.size) * 100)}%`);
+                const pct = file.size > 0 ? Math.round((offset / file.size) * 100) : 100;
+                setUploadStatus(`Transfiriendo... ${pct}%`);
                 lastUiUpdate = now;
               }
             }
-            const flushDeadline = Date.now() + 5000;
-            while (dc.bufferedAmount > 0 && dc.readyState === 'open' && Date.now() < flushDeadline) {
-              await new Promise((r) => setTimeout(r, 20));
-            }
             dc.send(JSON.stringify({ type: 'eof', size: file.size }));
+            try {
+              await withTimeout(ackPromise, ACK_TIMEOUT_MS, 'El receptor no confirmó la recepción completa');
+            } catch (e) {
+              reject(e);
+              return;
+            }
             transferComplete = true;
             setUploadStatus('¡Archivo transferido con éxito!');
             resolve();
           } catch (e) { reject(e); }
         };
 
+        dc.onclose = () => {
+          if (!transferComplete) reject(new Error('Canal P2P cerrado antes de completar la transferencia'));
+        };
         dc.onerror = () => { if (!transferComplete) reject(new Error('Error en el canal de datos P2P')); };
         pc.onconnectionstatechange = () => {
           if (pc.connectionState === 'failed' && !transferComplete) reject(new Error('Conexión WebRTC fallida'));
@@ -236,10 +311,9 @@ function App() {
       setTimeout(() => setUploadStatus(''), 5000);
     } finally {
       if (ws && ws.readyState === WebSocket.OPEN) ws.close();
-      // Retrasar pc.close() para que los chunks en tránsito lleguen al receptor
-      // antes de cerrar el transporte ICE/DTLS/SCTP subyacente.
+      // Retrasar pc.close() para que el ACK del receptor llegue antes de cerrar
       const pcRef = pc;
-      setTimeout(() => { try { pcRef?.close(); } catch (_) {} }, 8000);
+      setTimeout(() => { try { pcRef?.close(); } catch (_) {} }, 2000);
       setIsUploading(false);
     }
   };
@@ -251,6 +325,7 @@ function App() {
     setDownloadStatus('Conectando...');
     let ws = null;
     let pc = null;
+    let abortActiveTransfer = null;
     try {
       const tok = downloadToken.trim();
       ws = new WebSocket(`${WS_BASE_URL}/${tok}/signal`);
@@ -277,28 +352,62 @@ function App() {
         let eofReceived = false;
         const iceBuf = [];
         let remoteSet = false;
-        // Flag en el scope de la promesa: impide que errores post-transferencia llamen a reject
         let transferComplete = false;
+        let dataChannel = null;
+        let writable = null;
+        let writeChain = Promise.resolve();
+        let writeError = null;
+        let lastUiUpdate = 0;
+        let finishing = false;
+        let idleTimer = null;
+        let abortHttp = null;
 
-        const triggerDownload = () => {
-          if (transferComplete) return;
-          transferComplete = true;
-          setDownloadProgress(100);
-          setDownloadStatus('¡Descarga completada!');
-          resolve();
-          // setTimeout(0): da tiempo a React a renderizar el 100% antes de abrir el diálogo nativo
-          const blob = new Blob(chunks, { type: metadata?.mime || 'application/octet-stream' });
-          const url = URL.createObjectURL(blob);
-          setTimeout(() => {
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = metadata?.name || 'archivo';
-            a.style.display = 'none';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            setTimeout(() => URL.revokeObjectURL(url), 60000);
-          }, 0);
+        const resetIdle = () => {
+          if (idleTimer) clearTimeout(idleTimer);
+          idleTimer = setTimeout(() => {
+            if (abortHttp) abortHttp();
+            if (writable) { try { writable.abort(); } catch (_) {} }
+            reject(new Error('Tiempo de inactividad agotado'));
+          }, IDLE_TIMEOUT_MS);
+        };
+        resetIdle();
+
+        const abortWritable = () => {
+          if (writable) {
+            try { writable.abort(); } catch (_) {}
+            writable = null;
+          }
+        };
+        abortActiveTransfer = () => {
+          abortWritable();
+          if (abortHttp) abortHttp();
+        };
+
+        const finish = async () => {
+          if (finishing || transferComplete) return;
+          finishing = true;
+          if (idleTimer) clearTimeout(idleTimer);
+          try {
+            await writeChain;
+            if (writeError) throw writeError;
+            if (writable) {
+              await writable.close();
+              writable = null;
+            } else {
+              const blob = new Blob(chunks, { type: metadata?.mime || 'application/octet-stream' });
+              saveBlob(blob, metadata?.name || 'archivo');
+            }
+            transferComplete = true;
+            setDownloadProgress(100);
+            setDownloadStatus('¡Descarga completada!');
+            try {
+              dataChannel?.send(JSON.stringify({ type: 'ack', size: receivedSize }));
+            } catch (_) { /* el emisor ya se fue */ }
+            resolve();
+          } catch (error) {
+            abortWritable();
+            reject(error);
+          }
         };
 
         ws.onmessage = async (event) => {
@@ -319,114 +428,193 @@ function App() {
               if (remoteSet) await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
               else iceBuf.push(msg.candidate);
             } else if (msg.type === 'peer_disconnected') {
-              if (!transferComplete) reject(new Error('El emisor se desconectó'));
+              if (!transferComplete && !finishing) reject(new Error('El emisor se desconectó'));
             } else if (msg.type === 'http_upload_available') {
               // El emisor es curl/terminal: descargar via HTTP GET en lugar de WebRTC
-              setDownloadStatus(`Recibiendo de terminal: ${msg.filename || 'archivo'}...`);
+              if (idleTimer) clearTimeout(idleTimer);
               const totalSize = msg.size || 0;
+              const filename = msg.filename || 'archivo';
               (async () => {
+                let diskWriter = null;
+                let httpIdle = null;
                 try {
-                  const resp = await fetch(`${API_BASE_URL}/${tok}?dl=1`);
+                  if (supportsFileSystemAccess()) {
+                    try {
+                      diskWriter = await openDiskWriter(filename);
+                    } catch (e) {
+                      reject(e);
+                      return;
+                    }
+                  }
+
+                  // Sin FSA y archivo grande: dejar que el navegador lo guarde directo en disco
+                  if (!diskWriter && totalSize > LARGE_FILE_THRESHOLD) {
+                    setDownloadStatus('Archivo grande: la descarga continuará en el gestor de descargas del navegador...');
+                    startNativeDownload(`${API_BASE_URL}/${tok}?dl=1`, filename);
+                    transferComplete = true;
+                    resolve();
+                    return;
+                  }
+
+                  const controller = new AbortController();
+                  abortHttp = () => {
+                    controller.abort();
+                    if (diskWriter) { try { diskWriter.abort(); } catch (_) {} }
+                  };
+                  const resetHttpIdle = () => {
+                    if (httpIdle) clearTimeout(httpIdle);
+                    httpIdle = setTimeout(() => controller.abort(), IDLE_TIMEOUT_MS);
+                  };
+                  resetHttpIdle();
+
+                  setDownloadStatus(`Recibiendo de terminal: ${filename}...`);
+                  const resp = await fetch(`${API_BASE_URL}/${tok}?dl=1`, { signal: controller.signal });
                   if (!resp.ok) throw new Error(`Error HTTP ${resp.status}`);
-                  const contentDisp = resp.headers.get('Content-Disposition') || '';
-                  const fnMatch = contentDisp.match(/filename="?([^"]+)"?/);
-                  const filename = fnMatch ? fnMatch[1] : (msg.filename || 'archivo');
+                  if (!resp.body) throw new Error('El servidor no devolvió contenido');
+
                   const reader = resp.body.getReader();
                   const httpChunks = [];
                   let received = 0;
+                  let lastHttpUi = 0;
                   while (true) {
                     const { done, value } = await reader.read();
                     if (done) break;
-                    httpChunks.push(value);
+                    resetHttpIdle();
                     received += value.length;
-                    if (totalSize > 0) {
-                      const pct = Math.round((received / totalSize) * 100);
-                      setDownloadProgress(Math.min(99, pct));
-                      setDownloadStatus(`Descargando... ${Math.min(99, pct)}%`);
-                    } else {
-                      setDownloadStatus(`Descargando... ${(received / 1024 / 1024).toFixed(1)} MB`);
+                    if (diskWriter) await diskWriter.write(value);
+                    else httpChunks.push(value);
+                    const now = Date.now();
+                    if (now - lastHttpUi > 120) {
+                      lastHttpUi = now;
+                      if (totalSize > 0) {
+                        const pct = Math.min(99, Math.round((received / totalSize) * 100));
+                        setDownloadProgress(pct);
+                        setDownloadStatus(`Descargando... ${pct}%`);
+                      } else {
+                        setDownloadStatus(`Descargando... ${(received / 1024 / 1024).toFixed(1)} MB`);
+                      }
                     }
+                  }
+                  if (httpIdle) clearTimeout(httpIdle);
+                  if (diskWriter) {
+                    await diskWriter.close();
+                    diskWriter = null;
+                  } else {
+                    const blob = new Blob(httpChunks, { type: resp.headers.get('Content-Type') || 'application/octet-stream' });
+                    saveBlob(blob, filename);
                   }
                   transferComplete = true;
                   setDownloadProgress(100);
                   setDownloadStatus('¡Descarga completada!');
                   resolve();
-                  const blob = new Blob(httpChunks, { type: resp.headers.get('Content-Type') || 'application/octet-stream' });
-                  const url = URL.createObjectURL(blob);
-                  setTimeout(() => {
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = filename;
-                    a.style.display = 'none';
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
-                    setTimeout(() => URL.revokeObjectURL(url), 60000);
-                  }, 0);
-                } catch (e) { if (!transferComplete) reject(e); }
+                } catch (e) {
+                  if (httpIdle) clearTimeout(httpIdle);
+                  if (diskWriter) { try { await diskWriter.abort(); } catch (_) {} }
+                  if (!transferComplete) reject(e);
+                }
               })();
             }
-          } catch (e) { if (!transferComplete) reject(e); }
+          } catch (e) {
+            if (!transferComplete) reject(e);
+          }
         };
 
         pc.ondatachannel = (event) => {
           const dc = event.channel;
+          dataChannel = dc;
+          dc.binaryType = 'arraybuffer';
           setDownloadStatus('Canal P2P directo abierto. Recibiendo...');
+          resetIdle();
 
           dc.onmessage = (evt) => {
+            if (transferComplete || finishing) return;
+            resetIdle();
             if (typeof evt.data === 'string') {
-              if (!transferComplete) {
-                try {
-                  const msg = JSON.parse(evt.data);
-                  if (msg.type === 'metadata') {
-                    metadata = msg;
-                    setDownloadStatus(`Recibiendo: ${metadata.name}`);
-                  } else if (msg.type === 'eof') {
-                    eofReceived = true;
-                    if (!metadata?.size || receivedSize >= metadata.size || receivedSize >= (msg.size || 0)) {
-                      triggerDownload();
+              if (finishing) return;
+              try {
+                const msg = JSON.parse(evt.data);
+                if (msg.type === 'metadata') {
+                  metadata = msg;
+                  setDownloadStatus(`Recibiendo: ${metadata.name}`);
+                  (async () => {
+                    if (idleTimer) clearTimeout(idleTimer);
+                    try {
+                      if (supportsFileSystemAccess()) {
+                        try {
+                          writable = await openDiskWriter(metadata.name);
+                        } catch (e) {
+                          reject(e);
+                          return;
+                        }
+                      }
+                      if (!writable && metadata.size > LARGE_FILE_THRESHOLD) {
+                        if (!window.confirm('Tu navegador no permite guardar en disco desde esta página. El archivo se cargará en memoria y puede fallar. ¿Continuar?')) {
+                          reject(new Error('Descarga cancelada'));
+                          return;
+                        }
+                      }
+                      dc.send(JSON.stringify({ type: 'ready' }));
+                      resetIdle();
+                    } catch (e) {
+                      reject(e);
                     }
-                  }
-                } catch (_) {
-                  // Ignorar mensajes de control no JSON
+                  })();
+                } else if (msg.type === 'eof') {
+                  eofReceived = true;
+                  finish();
                 }
+              } catch (_) {
+                // Ignorar mensajes de control no JSON
               }
             } else {
-              if (transferComplete) return; // ignorar chunks tardíos post-triggerDownload
-              chunks.push(evt.data);
-              receivedSize += evt.data.byteLength;
+              const buf = evt.data;
+              receivedSize += buf.byteLength;
+              writeChain = writeChain
+                .then(async () => {
+                  if (writable) await writable.write(buf);
+                  else chunks.push(buf);
+                })
+                .catch((err) => { writeError = err; });
+
               if (metadata?.size > 0) {
-                const pct = Math.round((receivedSize / metadata.size) * 100);
-                setDownloadProgress(pct);
-                setDownloadStatus(`Descargando... ${pct}%`);
-                if (receivedSize >= metadata.size) {
-                  triggerDownload();
+                const now = Date.now();
+                if (now - lastUiUpdate > 120) {
+                  lastUiUpdate = now;
+                  const pct = Math.min(99, Math.round((receivedSize / metadata.size) * 100));
+                  setDownloadProgress(pct);
+                  setDownloadStatus(`Descargando... ${pct}%`);
                 }
+                if (receivedSize >= metadata.size) finish();
               } else {
                 setDownloadStatus(`Descargando... ${(receivedSize / 1024 / 1024).toFixed(1)} MB`);
               }
             }
           };
 
-          // Solo finalizar en onclose si hay evidencia de transferencia completa.
+          // Solo finalizar si hay evidencia de transferencia completa.
           dc.onclose = () => {
-            if (transferComplete) return;
-            if (eofReceived || (metadata?.size > 0 && receivedSize >= metadata.size) || (!metadata?.size && receivedSize > 0)) {
-              triggerDownload();
+            if (transferComplete || finishing) return;
+            if (eofReceived || (metadata?.size > 0 && receivedSize >= metadata.size)) {
+              finish();
               return;
             }
-            reject(new Error('Transferencia incompleta: el canal se cerró antes de recibir datos'));
+            abortWritable();
+            reject(new Error('Transferencia incompleta: el canal se cerró antes de recibir todos los datos'));
           };
-          // Solo reportar error si la transferencia no había terminado
-          dc.onerror = () => { if (!transferComplete) reject(new Error('Error en el canal de datos P2P')); };
+          dc.onerror = () => {
+            if (transferComplete || finishing) return;
+            abortWritable();
+            reject(new Error('Error en el canal de datos P2P'));
+          };
         };
 
         pc.onconnectionstatechange = () => {
-          if (pc.connectionState === 'failed' && !transferComplete)
+          if (pc.connectionState === 'failed' && !transferComplete && !finishing) {
+            abortWritable();
             reject(new Error('Conexión WebRTC fallida'));
+          }
         };
         ws.onerror = () => { if (!transferComplete) reject(new Error('Error de WebSocket')); };
-        setTimeout(() => { if (!transferComplete) reject(new Error('Tiempo de espera agotado')); }, 600000);
       });
 
       setTimeout(() => {
@@ -442,11 +630,14 @@ function App() {
         setDownloadProgress(0);
       }, 5000);
     } finally {
+      if (abortActiveTransfer) abortActiveTransfer();
       if (ws && ws.readyState === WebSocket.OPEN) ws.close();
-      if (pc) pc.close();
+      // Dar tiempo a que el ACK del DataChannel salga antes de cerrar el transporte
+      const pcRef = pc;
+      setTimeout(() => { try { pcRef?.close(); } catch (_) {} }, 2000);
       setIsDownloading(false);
     }
-  }
+  };
 
   const copyShareToken = () => {
     if (token) {

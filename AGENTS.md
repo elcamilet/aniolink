@@ -29,7 +29,7 @@ docker build -t aniolink .
 docker run --rm -p 3000:3000 -e PUBLIC_HOST=localhost aniolink
 ```
 
-No test suite, linter, or typechecker is configured. Minimum verification: `python -m py_compile backend/aniolink.py` and `npm run build`.
+No linter or typechecker is configured. Minimum verification: `python -m py_compile backend/aniolink.py` and `npm run build`. Integration tests live in `backend/tests/` and need `pip install -r backend/requirements-dev.txt` (or a venv) before `pytest backend/tests -q`.
 
 HTTP-relay smoke test (curl → curl, no browser):
 
@@ -47,7 +47,7 @@ The server stays in the background; stop it when finished.
 
 - **Single process only.** `active_bridges` and WebSocket peers are in memory; `uvicorn --workers N` or multiple replicas split tokens and break transfers.
 - **No server-side file storage or full-body buffering.** Use `request.stream()` and relay chunks directly; never read an upload with `await request.body()`.
-- **Browser receivers buffer the whole file in memory** (`chunks` → `Blob`); multi-GB browser downloads can exhaust memory despite the README's size claim. Server-side relay streaming is unbounded. There is no `showSaveFilePicker` branch in current code.
+- **Browser receivers stream to disk when the browser supports `showSaveFilePicker`**; otherwise they fall back to `chunks` → `Blob` and multi-GB downloads can still exhaust memory. The HTTP relay has an additional native-download fallback for large files without FSA. Server-side relay streaming is unbounded. Keep both receivers (`App.jsx` and `download.html`) in sync.
 - **Python 3.9** in the image: no `X | Y` unions, `match`, or other 3.10+ syntax.
 - **No Vite proxy.** `App.jsx` uses `window.location.origin` as the API base, so `npm run dev` on :5173 cannot reach the backend. Use Docker, or place a built `frontend/dist` in `static/` at the repo root (don't commit it) and run `uvicorn backend.aniolink:app` from there.
 - `python aniolink.py` calls `uvicorn.run()` before the bottom `StaticFiles` mount, so that entrypoint never serves the SPA; the mount only runs when an ASGI server imports the module (uvicorn/Docker). Put any new import-time setup above the `if __name__ == "__main__"` block, and declare API routes before the mount.

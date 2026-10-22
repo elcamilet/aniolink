@@ -71,6 +71,44 @@
     const TOKEN = '$token';
     const WS_URL = window.location.origin.replace(/^http/, 'ws') + '/' + TOKEN + '/signal';
     const ICE = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }] };
+    const LARGE_FILE_THRESHOLD = 1024 * 1024 * 1024;
+    const IDLE_TIMEOUT_MS = 60000;
+    const supportsFsa = typeof window.showSaveFilePicker === 'function';
+
+    async function openDiskWriter(filename) {
+      if (!supportsFsa) return null;
+      try {
+        const handle = await window.showSaveFilePicker({ suggestedName: filename || 'archivo' });
+        return await handle.createWritable();
+      } catch (error) {
+        if (error && error.name === 'AbortError') throw error;
+        return null;
+      }
+    }
+
+    function saveBlob(blob, filename) {
+      const url = URL.createObjectURL(blob);
+      setTimeout(() => {
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename || 'archivo';
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+      }, 0);
+    }
+
+    function startNativeDownload(url, filename) {
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename || '';
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    }
 
     async function startDownload() {
       const btn = document.getElementById('btn');
@@ -86,6 +124,7 @@
 
       let ws = null;
       let pc = null;
+      let abortActiveTransfer = null;
       try {
         ws = new WebSocket(WS_URL);
         await new Promise((resolve, reject) => {
@@ -106,32 +145,82 @@
           let metadata = null;
           const chunks = [];
           let receivedSize = 0;
+          let eofReceived = false;
           const iceBuf = [];
           let remoteSet = false;
-          // Evita que errores post-transferencia llamen a reject o muestren error en UI
           let transferComplete = false;
+          let dataChannel = null;
+          let writable = null;
+          let writeChain = Promise.resolve();
+          let writeError = null;
+          let finishing = false;
+          let idleTimer = null;
+          let abortHttp = null;
+          let abortReason = null;
+          let lastUi = 0;
 
-          const triggerDownload = () => {
-            if (transferComplete) return;
-            transferComplete = true;
-            bar.style.width = '100%';
-            text.textContent = '100%';
-            status.textContent = '¡Descarga completada!';
-            btn.textContent = '¡Completado!';
-            resolve();
-            // setTimeout(0): permite que el navegador pinte el 100% antes de abrir el diálogo
-            const blob = new Blob(chunks, { type: metadata?.mime || 'application/octet-stream' });
-            const url = URL.createObjectURL(blob);
-            setTimeout(() => {
-              const a = document.createElement('a');
-              a.href = url;
-              a.download = metadata?.name || 'archivo';
-              a.style.display = 'none';
-              document.body.appendChild(a);
-              a.click();
-              document.body.removeChild(a);
-              setTimeout(() => URL.revokeObjectURL(url), 60000);
-            }, 0);
+          const setProgress = (received, total, force) => {
+            const now = Date.now();
+            if (!force && now - lastUi < 120) return;
+            lastUi = now;
+            if (total > 0) {
+              const pct = Math.min(99, Math.round((received / total) * 100));
+              bar.style.width = pct + '%';
+              text.textContent = pct + '%';
+              status.textContent = 'Descargando... ' + pct + '%';
+            } else {
+              status.textContent = 'Descargando... ' + (received / 1024 / 1024).toFixed(1) + ' MB';
+            }
+          };
+
+          const resetIdle = () => {
+            if (idleTimer) clearTimeout(idleTimer);
+            idleTimer = setTimeout(() => {
+              abortReason = 'Tiempo de inactividad agotado';
+              if (abortHttp) abortHttp();
+              if (writable) { try { writable.abort(); } catch (_) {} }
+              reject(new Error(abortReason));
+            }, IDLE_TIMEOUT_MS);
+          };
+          resetIdle();
+
+          const abortWritable = () => {
+            if (writable) {
+              try { writable.abort(); } catch (_) {}
+              writable = null;
+            }
+          };
+          abortActiveTransfer = () => {
+            abortWritable();
+            if (abortHttp) abortHttp();
+          };
+
+          const finish = async () => {
+            if (finishing || transferComplete) return;
+            finishing = true;
+            if (idleTimer) clearTimeout(idleTimer);
+            try {
+              await writeChain;
+              if (writeError) throw writeError;
+              if (writable) {
+                await writable.close();
+                writable = null;
+              } else {
+                saveBlob(new Blob(chunks, { type: metadata?.mime || 'application/octet-stream' }), metadata?.name || 'archivo');
+              }
+              transferComplete = true;
+              bar.style.width = '100%';
+              text.textContent = '100%';
+              status.textContent = '¡Descarga completada!';
+              btn.textContent = '¡Completado!';
+              try {
+                dataChannel?.send(JSON.stringify({ type: 'ack', size: receivedSize }));
+              } catch (_) { /* el emisor ya se fue */ }
+              resolve();
+            } catch (e) {
+              abortWritable();
+              reject(e);
+            }
           };
 
           ws.onmessage = async (event) => {
@@ -152,34 +241,73 @@
                 if (remoteSet) await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
                 else iceBuf.push(msg.candidate);
               } else if (msg.type === 'peer_disconnected') {
-                if (!transferComplete) reject(new Error('El emisor se desconectó'));
+                if (!transferComplete && !finishing) reject(new Error('El emisor se desconectó'));
               } else if (msg.type === 'http_upload_available') {
                 // El emisor es curl/terminal: descargar via HTTP GET en lugar de WebRTC
+                if (idleTimer) clearTimeout(idleTimer);
                 const totalSize = msg.size || 0;
-                status.textContent = 'Recibiendo de terminal: ' + (msg.filename || 'archivo') + '...';
+                const filename = msg.filename || 'archivo';
                 (async () => {
+                  let diskWriter = null;
+                  let httpIdle = null;
                   try {
-                    const resp = await fetch(window.location.origin + '/' + TOKEN + '?dl=1');
+                    if (supportsFsa) {
+                      try {
+                        diskWriter = await openDiskWriter(filename);
+                      } catch (e) {
+                        reject(e);
+                        return;
+                      }
+                    }
+
+                    // Sin FSA y archivo grande: dejar que el navegador lo guarde directo en disco
+                    if (!diskWriter && totalSize > LARGE_FILE_THRESHOLD) {
+                      status.textContent = 'Archivo grande: la descarga continuará en el gestor de descargas del navegador...';
+                      startNativeDownload(window.location.origin + '/' + TOKEN + '?dl=1', filename);
+                      transferComplete = true;
+                      resolve();
+                      return;
+                    }
+
+                    const controller = new AbortController();
+                    abortHttp = () => {
+                      abortReason = abortReason || 'Descarga cancelada';
+                      controller.abort();
+                      if (diskWriter) { try { diskWriter.abort(); } catch (_) {} }
+                    };
+                    const resetHttpIdle = () => {
+                      if (httpIdle) clearTimeout(httpIdle);
+                      httpIdle = setTimeout(() => {
+                        abortReason = 'Tiempo de inactividad agotado';
+                        controller.abort();
+                        if (diskWriter) { try { diskWriter.abort(); } catch (_) {} }
+                      }, IDLE_TIMEOUT_MS);
+                    };
+                    resetHttpIdle();
+
+                    status.textContent = 'Recibiendo de terminal: ' + filename + '...';
+                    const resp = await fetch(window.location.origin + '/' + TOKEN + '?dl=1', { signal: controller.signal });
                     if (!resp.ok) throw new Error('Error HTTP ' + resp.status);
-                    const contentDisp = resp.headers.get('Content-Disposition') || '';
-                    const fnMatch = contentDisp.match(/filename="?([^"]+)"?/);
-                    const filename = fnMatch ? fnMatch[1] : (msg.filename || 'archivo');
+                    if (!resp.body) throw new Error('El servidor no devolvió contenido');
+
                     const reader = resp.body.getReader();
                     const httpChunks = [];
                     let received = 0;
                     while (true) {
                       const { done, value } = await reader.read();
                       if (done) break;
-                      httpChunks.push(value);
+                      resetHttpIdle();
                       received += value.length;
-                      if (totalSize > 0) {
-                        const pct = Math.round(received / totalSize * 100);
-                        bar.style.width = pct + '%';
-                        text.textContent = pct + '%';
-                        status.textContent = 'Descargando... ' + pct + '%';
-                      } else {
-                        status.textContent = 'Descargando... ' + (received / 1024 / 1024).toFixed(1) + ' MB';
-                      }
+                      if (diskWriter) await diskWriter.write(value);
+                      else httpChunks.push(value);
+                      setProgress(received, totalSize, false);
+                    }
+                    if (httpIdle) clearTimeout(httpIdle);
+                    if (diskWriter) {
+                      await diskWriter.close();
+                      diskWriter = null;
+                    } else {
+                      saveBlob(new Blob(httpChunks, { type: resp.headers.get('Content-Type') || 'application/octet-stream' }), filename);
                     }
                     transferComplete = true;
                     bar.style.width = '100%';
@@ -187,74 +315,123 @@
                     status.textContent = '¡Descarga completada!';
                     btn.textContent = '¡Completado!';
                     resolve();
-                    const blob = new Blob(httpChunks, { type: resp.headers.get('Content-Type') || 'application/octet-stream' });
-                    const url = URL.createObjectURL(blob);
-                    setTimeout(() => {
-                      const a = document.createElement('a');
-                      a.href = url;
-                      a.download = filename;
-                      a.style.display = 'none';
-                      document.body.appendChild(a);
-                      a.click();
-                      document.body.removeChild(a);
-                      setTimeout(() => URL.revokeObjectURL(url), 60000);
-                    }, 0);
-                  } catch (e) { if (!transferComplete) reject(e); }
+                  } catch (e) {
+                    if (httpIdle) clearTimeout(httpIdle);
+                    if (diskWriter) { try { await diskWriter.abort(); } catch (_) {} }
+                    if (!transferComplete) reject(new Error(abortReason || e.message));
+                  }
                 })();
               }
-            } catch (e) { if (!transferComplete) reject(e); }
+            } catch (e) {
+              if (!transferComplete) reject(e);
+            }
           };
 
           pc.ondatachannel = (event) => {
             const dc = event.channel;
+            dataChannel = dc;
+            dc.binaryType = 'arraybuffer';
             status.textContent = 'Canal P2P directo abierto. Recibiendo...';
+            resetIdle();
 
             dc.onmessage = (evt) => {
+              if (transferComplete || finishing) return;
+              resetIdle();
               if (typeof evt.data === 'string') {
-                if (!transferComplete) {
-                  const m = JSON.parse(evt.data);
-                  if (m.type === 'metadata') {
-                    metadata = m;
+                try {
+                  const msg = JSON.parse(evt.data);
+                  if (msg.type === 'metadata') {
+                    metadata = msg;
                     status.textContent = 'Recibiendo: ' + metadata.name;
+                    (async () => {
+                      if (idleTimer) clearTimeout(idleTimer);
+                      try {
+                        if (supportsFsa) {
+                          try {
+                            writable = await openDiskWriter(metadata.name);
+                          } catch (e) {
+                            reject(e);
+                            return;
+                          }
+                        }
+                        if (!writable && metadata.size > LARGE_FILE_THRESHOLD) {
+                          if (!window.confirm('Tu navegador no permite guardar en disco desde esta página. El archivo se cargará en memoria y puede fallar. ¿Continuar?')) {
+                            reject(new Error('Descarga cancelada'));
+                            return;
+                          }
+                        }
+                        dc.send(JSON.stringify({ type: 'ready' }));
+                        resetIdle();
+                      } catch (e) {
+                        reject(e);
+                      }
+                    })();
+                  } else if (msg.type === 'eof') {
+                    eofReceived = true;
+                    finish();
                   }
+                } catch (_) {
+                  // Ignorar mensajes de control no JSON
                 }
               } else {
-                if (transferComplete) return; // ignorar chunks tardíos post-triggerDownload
-                chunks.push(evt.data);
-                receivedSize += evt.data.byteLength;
+                const buf = evt.data;
+                receivedSize += buf.byteLength;
+                writeChain = writeChain
+                  .then(async () => {
+                    if (writable) await writable.write(buf);
+                    else chunks.push(buf);
+                  })
+                  .catch((err) => { writeError = err; });
+
                 if (metadata?.size > 0) {
-                  const pct = Math.round(receivedSize / metadata.size * 100);
-                  bar.style.width = pct + '%';
-                  text.textContent = pct + '%';
-                  status.textContent = 'Descargando... ' + pct + '%';
-                  // Disparar descarga cuando llegan todos los bytes (fix para archivos pequeños)
-                  if (receivedSize >= metadata.size) triggerDownload();
+                  setProgress(receivedSize, metadata.size, false);
+                  if (receivedSize >= metadata.size) finish();
                 } else {
-                  status.textContent = 'Descargando... ' + (receivedSize / 1024 / 1024).toFixed(1) + ' MB';
+                  setProgress(receivedSize, 0, false);
                 }
               }
             };
 
-            // Fallback: si onmessage no alcanzó el total (tamaño desconocido o último chunk tardío)
-            dc.onclose = () => triggerDownload();
-            dc.onerror = () => { if (!transferComplete) reject(new Error('Error en canal de datos')); };
+            dc.onclose = () => {
+              if (transferComplete || finishing) return;
+              if (eofReceived || (metadata?.size > 0 && receivedSize >= metadata.size)) {
+                finish();
+                return;
+              }
+              abortWritable();
+              reject(new Error('Transferencia incompleta: el canal se cerró antes de recibir todos los datos'));
+            };
+            dc.onerror = () => {
+              if (transferComplete || finishing) return;
+              abortWritable();
+              reject(new Error('Error en el canal de datos P2P'));
+            };
           };
 
           pc.onconnectionstatechange = () => {
-            if (pc.connectionState === 'failed' && !transferComplete)
+            if (pc.connectionState === 'failed' && !transferComplete && !finishing) {
+              abortWritable();
               reject(new Error('Conexión WebRTC fallida'));
+            }
           };
           ws.onerror = () => { if (!transferComplete) reject(new Error('Error de WebSocket')); };
-          setTimeout(() => { if (!transferComplete) reject(new Error('Tiempo de espera agotado')); }, 600000);
         });
 
+        setTimeout(() => {
+          status.textContent = '';
+          bar.style.width = '0%';
+          text.textContent = '0%';
+        }, 3000);
       } catch (e) {
         status.textContent = '❌ ' + (e.message || 'Error desconocido');
         btn.disabled = false;
         btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor" viewBox="0 0 256 256"><path d="M224,152v56a16,16,0,0,1-16,16H48a16,16,0,0,1-16-16V152a8,8,0,0,1,16,0v56H208V152a8,8,0,0,1,16,0Zm-101.66,5.66a8,8,0,0,0,11.32,0l40-40a8,8,0,0,0-11.32-11.32L136,132.69V40a8,8,0,0,0-16,0v92.69L93.66,106.34a8,8,0,0,0-11.32,11.32Z"></path></svg> Reintentar';
       } finally {
+        if (abortActiveTransfer) abortActiveTransfer();
         if (ws && ws.readyState === WebSocket.OPEN) ws.close();
-        if (pc) pc.close();
+        // Dar tiempo a que el ACK del DataChannel salga antes de cerrar el transporte
+        const pcRef = pc;
+        setTimeout(() => { try { pcRef?.close(); } catch (_) {} }, 2000);
       }
     }
   </script>
