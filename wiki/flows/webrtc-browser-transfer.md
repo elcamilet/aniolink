@@ -7,7 +7,7 @@ sources:
   - backend/aniolink.py
   - frontend/src/App.jsx
   - backend/templates/download.html
-synced: bf672cf
+synced: 72f38a0
 confidence: high
 related:
   - ../architecture.md
@@ -17,7 +17,7 @@ related:
 
 # WebRTC browser transfer
 
-Browser-to-browser is the only mode where file bytes never touch the server. The server relays SDP and ICE, then steps out of the path.
+Browser-to-browser is the only mode where file bytes never touch the server, and it applies when the receiver can write to disk with File System Access. Without FSA the receiver page skips signaling and uses the [HTTP relay](./http-relay.md) with the browser's native download manager; the server then does see the bytes.
 
 ```
 sender                         server                        receiver
@@ -37,26 +37,28 @@ The server also inspects frames: a `metadata` message is stored on the bridge re
 
 ## DataChannel protocol
 
-The sender opens a reliable, ordered channel named `file` and sets `binaryType = "arraybuffer"` on both ends (`download.html:333`). The sequence is:
+The sender opens a reliable, ordered channel named `file` and sets `binaryType = "arraybuffer"` on both ends (`download.html:367`). The sequence is:
 
 1. Sender sends a `metadata` JSON frame with name, size and MIME.
-2. Receiver opens the save target. With File System Access it calls `showSaveFilePicker`; otherwise it warns for files above 1 GB and keeps a Blob target.
-3. Receiver replies `{"type":"ready"}` (`download.html:363`). The sender waits up to five minutes for this before sending bytes.
-4. Sender slices the file in 16 KB chunks (`App.jsx:261`), sending while `bufferedAmount` is under 2 MB and pausing until `bufferedamountlow` (512 KB) or a periodic re-check confirms the buffer drained (`App.jsx:202`).
-5. Sender sends `{"type":"eof","size":N}` (`App.jsx:279`).
-6. Receiver waits for the pending writes, closes the disk file (or builds the Blob), validates the size, and sends `{"type":"ack","size":N}` (`download.html:217`).
-7. Only after the ack does the sender show success. The ack timeout is two minutes; the sender no longer treats "all chunks queued" as delivered.
+2. Receiver opens the save target with `showSaveFilePicker`. If the picker fails and the file is over 1 GB, it sends `{"type":"http_fallback"}` instead of `ready`; the sender stops the DataChannel path and waits for the native download to trigger the HTTP PUT.
+3. Receiver replies `{"type":"ready"}` (`download.html:417`). The sender waits up to five minutes for this before sending bytes.
+4. Sender slices the file in 16 KB chunks (`App.jsx:317`), sending while `bufferedAmount` is under 2 MB and pausing until `bufferedamountlow` (512 KB) or a periodic re-check confirms the buffer drained (`App.jsx:247`).
+5. Receiver writes each chunk and sends `{"type":"progress","received":N}` about every 1 MB written. The sender tracks the last value and stops when it is more than 4 MB ahead; it waits for the next progress frame, with a two-minute stall timeout. This is the guard that keeps a slow disk from letting the sender fill the receiver's JavaScript queue.
+6. Sender sends `{"type":"eof","size":N}` (`App.jsx:342`).
+7. Receiver waits for the pending writes, closes the disk file (or builds the Blob), validates the size, and sends `{"type":"ack","size":N}` (`download.html:251`).
+8. Only after the ack does the sender show success. The ack timeout is two minutes; the sender no longer treats "all chunks queued" as delivered.
 
 A zero-byte file is metadata, ready, eof, ack: no binary chunks. A 1 KB file is metadata, ready, one chunk, eof, ack. Completion is driven by eof or by reaching the announced size, never by the channel closing.
 
 ## Receiver discipline
 
-The standalone page (`download.html:113`) is the receiver that ships; the SPA's `handleDownload` (`App.jsx:321`) mirrors it but is not reachable from the SPA UI. Both enforce the same rules:
+The standalone page (`download.html:133`) is the receiver that ships; the SPA's `handleDownload` (`App.jsx:384`) mirrors it but is not reachable from the SPA UI. Both enforce the same rules:
 
 - `binaryType` is set before any data arrives.
-- An idle timer of 60 seconds is reset by every chunk or control frame; there is no absolute transfer timeout (`download.html:177`).
+- An idle timer of 60 seconds is reset by every chunk or control frame; there is no absolute transfer timeout (`download.html:212`).
 - A close without eof or a complete size aborts the writable file and reports an error; it does not offer a truncated file.
 - Progress updates are throttled to roughly one per 120 ms.
+- A receiver without FSA never enters this flow; it goes straight to the native HTTP download.
 
 The receiver's file handle is opened when metadata arrives, which is why the `ready` frame exists: the sender must not fill the SCTP buffer while the user is choosing a destination.
 

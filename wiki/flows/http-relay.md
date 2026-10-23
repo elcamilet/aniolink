@@ -8,7 +8,7 @@ sources:
   - frontend/src/App.jsx
   - backend/templates/download.html
   - backend/tests/test_transfer.py
-synced: bf672cf
+synced: 72f38a0
 confidence: high
 related:
   - ../architecture.md
@@ -42,13 +42,15 @@ The upload handler then waits up to `TIMEOUT_SECONDS` for `download_ready` and, 
 
 ## Download side
 
-A browser page load sends `Accept: text/html` and receives the receiver template, not the stream. The raw download is a GET without that header, or with `?dl=1` to force it from the SPA. The handler claims the downloader with `409` on a second concurrent GET (`aniolink.py:348`), sets `download_connected`, and tells the sender's WebSocket that a curl receiver appeared (`aniolink.py:359`) so a browser uploader can switch from WebRTC to `fetch` PUT.
+A browser page load sends `Accept: text/html` and receives the receiver template, not the stream. The raw download is a GET without that header, or with `?dl=1` to force it from the SPA. The handler claims the downloader with `409` on a second concurrent GET (`aniolink.py:348`), sets `download_connected`, and tells **both** WebSocket peers that a raw receiver appeared (`aniolink.py:359`) so a browser uploader can switch from WebRTC to `fetch` PUT. Notifying both matters when the sender is the `down` socket.
 
 The GET waits for `upload_ready`, then returns a `StreamingResponse` with `Content-Disposition` and, when known, `Content-Length`. The first iteration of `stream_direct_p2p` sets `download_ready`, which releases the uploader. The generator reads `request.stream()` in 64 KB chunks, increments `bytes_transferred`, touches `last_activity` every 16 chunks, and in its `finally` compares the total against `Content-Length` (`aniolink.py:136`). A mismatch, a receiver disconnect (`CancelledError`) or a stream error sets `transfer_error`; the waiting PUT becomes `502` (`aniolink.py:310`).
 
 ## How each frontend enters the flow
 
-A browser sender that sees `curl_download_connected` sends its file metadata over the WebSocket and does a raw-body `PUT` (`App.jsx:225`); it does not build a `FormData`. A browser receiver that sees `http_upload_available` fetches `/{token}?dl=1`, feeds the reader into `showSaveFilePicker` when available, otherwise into a Blob, and falls back to a native download for files over 1 GB when FSA is not available (`App.jsx:432`, `download.html:245`). The standalone page is the receiver that actually ships; its logic mirrors the SPA's unused `handleDownload`.
+A browser sender that sees `curl_download_connected` sends its file metadata over the WebSocket and does a raw-body `PUT` (`App.jsx:274`); it does not build a `FormData`. A browser receiver that sees `http_upload_available` fetches `/{token}?dl=1`; with FSA it feeds the reader into `showSaveFilePicker`, otherwise it goes through a native download for files over 1 GB (`download.html:279`).
+
+The standalone page takes this flow directly when the browser has no File System Access API: its click opens `/{token}?dl=1` and skips the signaling WebSocket entirely. The server notifies the sender, the sender PUTs, and the browser's download manager saves the file without loading it into memory. If FSA exists but the picker fails for a file over 1 GB, the DataChannel sends `http_fallback`; the page shows a "Guardar con el navegador" button and the same HTTP path starts on that click. The sender ignores the later DataChannel close and `peer_disconnected` once it has seen the fallback.
 
 ## Failure boundaries
 

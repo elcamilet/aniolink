@@ -8,7 +8,7 @@ sources:
   - backend/templates/download.html
   - frontend/src/main.jsx
   - Dockerfile
-synced: bf672cf
+synced: 72f38a0
 confidence: high
 related:
   - ./flows/http-relay.md
@@ -34,7 +34,7 @@ browser sender ── HTTP PUT ── relaying server ── GET ── curl rec
 curl sender    ── PUT ── relaying server ── GET ?dl=1 ── browser receiver
 ```
 
-Browser-to-browser traffic bypasses the server after signaling. The other three modes share the same `P2PBridge` upload/download events, so a browser that discovers a terminal peer switches to `fetch` instead of WebRTC. The two flows are documented in [http-relay](./flows/http-relay.md) and [webrtc-browser-transfer](./flows/webrtc-browser-transfer.md).
+Browser-to-browser traffic bypasses the server after signaling, but only when the receiver can write to disk (File System Access). A browser without FSA does not open a DataChannel for the file: the receiver page downloads through the HTTP relay with the browser's native download manager, and the server tells the sender to switch to the PUT. The two flows are documented in [http-relay](./flows/http-relay.md) and [webrtc-browser-transfer](./flows/webrtc-browser-transfer.md).
 
 ## Components
 
@@ -46,7 +46,7 @@ Browser-to-browser traffic bypasses the server after signaling. The other three 
 | `backend/templates/download.html` | server-rendered receiver for `GET /{token}` with `Accept: text/html` |
 | `Dockerfile` | multi-stage production image: Vite build on Node 22, runtime on Python 3.9 + uvicorn |
 
-The SPA mounts once through `frontend/src/main.jsx:6`; there is no client-side router. `/` is the SPA, while `GET /{token}` is answered by the backend and renders the standalone receiver template. The receiver logic is duplicated in `App.jsx:321` and `download.html:113`; protocol changes must reach both.
+The SPA mounts once through `frontend/src/main.jsx:6`; there is no client-side router. `/` is the SPA, while `GET /{token}` is answered by the backend and renders the standalone receiver template. The receiver logic is duplicated in `App.jsx:384` and `download.html:133`; protocol changes must reach both.
 
 In production the Docker image copies the built SPA to `/app/static`, and the module mounts it only when that directory exists relative to the process working directory (`aniolink.py:510`). API routes are declared before the mount so they win. Running `python aniolink.py` calls `uvicorn.run` at `aniolink.py:501` before the mount line is reached, so that entrypoint serves the API but not the SPA.
 

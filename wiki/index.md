@@ -17,4 +17,4 @@
 ## Decisions
 
 - [Transfer integrity decisions](./decisions/transfer-integrity.md) — Explains why tokens are unique, claims are exclusive, expiry follows activity and uploads are verified against Content-Length.
-- [Large-file strategy](./decisions/large-file-strategy.md) — Explains disk streaming, the Blob and native-download fallbacks, idle timeouts, 16 KB chunks and the ready/ack handshake.
+- [Large-file strategy](./decisions/large-file-strategy.md) — Explains disk streaming, the no-FSA HTTP/native-download fallback, idle timeouts, the receiver progress window, 16 KB chunks and the ready/ack handshake.

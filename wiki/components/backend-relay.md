@@ -7,7 +7,7 @@ sources:
   - backend/tests/conftest.py
   - backend/tests/test_transfer.py
   - backend/tests/test_unit.py
-synced: bf672cf
+synced: 72f38a0
 confidence: high
 related:
   - ../architecture.md
@@ -42,7 +42,7 @@ The same object carries the WebSocket peers (`up_ws`, `down_ws`), `signal_lock`,
 | `GET /{token}/info` | metadata from the sender's WebSocket or from the HTTP upload (`aniolink.py:402`) |
 | `WS /{token}/signal` | SDP/ICE relay and metadata capture (`aniolink.py:418`) |
 
-The catch-all `WS /{path:path}` at `aniolink.py:505` exists only to reject stray WebSocket upgrades before `StaticFiles` sees them. The SPA mount is last and conditional on a `static/` directory in the process CWD (`aniolink.py:510`).
+When a raw GET claims a download, the server sends `curl_download_connected` to both sockets, so a browser sender that connected second still switches to the HTTP PUT. The catch-all `WS /{path:path}` at `aniolink.py:505` exists only to reject stray WebSocket upgrades before `StaticFiles` sees them. The SPA mount is last and conditional on a `static/` directory in the process CWD (`aniolink.py:510`).
 
 ## Error and lifecycle rules
 
