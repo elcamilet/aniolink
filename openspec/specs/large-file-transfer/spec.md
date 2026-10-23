@@ -92,12 +92,31 @@ Cuando el navegador soporte File System Access API, el receptor SHALL escribir l
 
 ### Requirement: Fallback sin File System Access API
 
-En navegadores sin File System Access API, el receptor SHALL usar Blob y MUST advertir al usuario de que el archivo se cargará en memoria antes de continuar con archivos grandes.
+En navegadores sin File System Access API, el receptor SHALL descargar mediante el relay HTTP y el gestor de descargas nativo, sin acumular el archivo en memoria. MUST informar de que la descarga usa el servidor.
 
 #### Scenario: Navegador sin soporte
 
 - **WHEN** el receptor no dispone de `showSaveFilePicker`
-- **THEN** la descarga funciona mediante Blob y la interfaz informa de la limitación de memoria
+- **THEN** la descarga se inicia a través de `/{token}?dl=1` con el gestor del navegador y no se acumula en memoria
+
+#### Scenario: FSA rechazado con archivo grande
+
+- **WHEN** el selector de archivos falla o se pierde la activación del usuario con un archivo de más de 1 GB
+- **THEN** el receptor ofrece guardar con el navegador mediante el relay HTTP en lugar de usar Blob
+
+### Requirement: Ventana de progreso del receptor
+
+El emisor SHALL esperar confirmaciones de bytes escritos por el receptor y MUST NOT adelantarse más de una ventana configurada, para que la cola del receptor no crezca sin límite.
+
+#### Scenario: Receptor más lento que la red
+
+- **WHEN** el receptor escribe en disco más despacio de lo que llegan los chunks
+- **THEN** el emisor se detiene al llenar la ventana y reanuda cuando el receptor confirma progreso
+
+#### Scenario: Receptor que deja de confirmar
+
+- **WHEN** el receptor no envía progreso durante el timeout configurado
+- **THEN** el emisor corta la transferencia con un error explícito
 
 ### Requirement: Progreso sin bloquear la interfaz
 

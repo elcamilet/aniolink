@@ -1,9 +1,12 @@
 import hashlib
+import json
 import re
 import threading
 import time
+from urllib.parse import urlparse
 
 import httpx
+from websockets.sync.client import connect
 
 
 def create_token(client: httpx.Client) -> str:
@@ -222,3 +225,49 @@ def test_active_transfer_does_not_expire(base_url):
         assert get_result.get("status") == 200, get_result
         assert get_result.get("length") == 20 * 1024
 
+
+
+def test_http_download_notifies_both_websocket_peers(base_url):
+    port = urlparse(base_url).port
+    ws_base = f"ws://127.0.0.1:{port}"
+    with httpx.Client(base_url=base_url, timeout=30) as client:
+        token = create_token(client)
+        put_result = {}
+        put_thread = threading.Thread(
+            target=_put_bytes,
+            args=(base_url, token, "notify.txt", b"x" * 1024, put_result),
+        )
+        put_thread.start()
+        wait_for_upload(client, token, "notify.txt")
+
+        def recv_until(ws, expected, timeout=5):
+            while True:
+                message = json.loads(ws.recv(timeout=timeout))
+                if message["type"] == expected:
+                    return message
+
+        with connect(f"{ws_base}/{token}/signal") as up, connect(f"{ws_base}/{token}/signal") as down:
+            recv_until(up, "peer_connected")
+            recv_until(down, "peer_connected")
+
+            get_result = {}
+
+            def receiver():
+                with httpx.Client(base_url=base_url, timeout=30) as receiver_client:
+                    response = receiver_client.get(f"/{token}")
+                    get_result["status"] = response.status_code
+                    get_result["length"] = len(response.content)
+
+            get_thread = threading.Thread(target=receiver)
+            get_thread.start()
+
+            recv_until(up, "curl_download_connected")
+            recv_until(down, "curl_download_connected")
+
+            get_thread.join(timeout=15)
+            put_thread.join(timeout=15)
+            assert not get_thread.is_alive()
+            assert not put_thread.is_alive()
+            assert put_result.get("status") == 200, put_result
+            assert get_result.get("status") == 200, get_result
+            assert get_result.get("length") == 1024

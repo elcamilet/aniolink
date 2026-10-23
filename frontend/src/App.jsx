@@ -14,6 +14,9 @@ const LARGE_FILE_THRESHOLD = 1024 * 1024 * 1024;
 const IDLE_TIMEOUT_MS = 60000;
 const READY_TIMEOUT_MS = 300000;
 const ACK_TIMEOUT_MS = 120000;
+const PROGRESS_TIMEOUT_MS = 120000;
+const PROGRESS_INTERVAL = 1024 * 1024;
+const RECEIVER_WINDOW = 4 * 1024 * 1024;
 
 const supportsFileSystemAccess = () =>
   typeof window !== 'undefined' && typeof window.showSaveFilePicker === 'function';
@@ -150,13 +153,35 @@ function App() {
       // 4. Esperar peer, señalizar y transferir
       await new Promise((resolve, reject) => {
         let transferComplete = false;
+        let httpFallback = false;
         let readyResolve;
         let ackResolve;
+        let fallbackResolve;
         const readyPromise = new Promise((res) => { readyResolve = res; });
         const ackPromise = new Promise((res) => { ackResolve = res; });
+        const fallbackPromise = new Promise((res) => { fallbackResolve = res; });
         const MAX_BUFFERED_AMOUNT = 2 * 1024 * 1024;
         const LOW_WATERMARK = 512 * 1024;
+        let receiverWritten = 0;
+        let progressWaiters = [];
         dc.bufferedAmountLowThreshold = LOW_WATERMARK;
+
+        const notifyProgress = () => {
+          const waiters = progressWaiters;
+          progressWaiters = [];
+          waiters.forEach((waiter) => waiter());
+        };
+
+        const enterHttpFallback = () => {
+          if (httpFallback) return;
+          httpFallback = true;
+          fallbackResolve();
+          setTimeout(() => {
+            if (!transferComplete) {
+              reject(new Error('El receptor no inició la descarga HTTP'));
+            }
+          }, 600000);
+        };
 
         dc.onmessage = (event) => {
           if (typeof event.data !== 'string') return;
@@ -164,10 +189,30 @@ function App() {
             const msg = JSON.parse(event.data);
             if (msg.type === 'ready') readyResolve();
             else if (msg.type === 'ack') ackResolve(msg);
+            else if (msg.type === 'progress') {
+              receiverWritten = Math.max(receiverWritten, Number(msg.received) || 0);
+              notifyProgress();
+            } else if (msg.type === 'http_fallback') {
+              // El receptor no puede escribir a disco: se pasa al relay HTTP
+              enterHttpFallback();
+            }
           } catch (_) {
             // Ignorar mensajes de control no JSON
           }
         };
+
+        // El receptor manda progress cada ~1 MB escrito. Sin esta ventana, el
+        // emisor llena la cola JS del receptor y el DataChannel se cierra.
+        const waitForReceiverWindow = (offset) => new Promise((windowResolve) => {
+          const check = () => {
+            if (transferComplete || offset - receiverWritten <= RECEIVER_WINDOW) {
+              windowResolve();
+            } else {
+              progressWaiters.push(check);
+            }
+          };
+          check();
+        });
 
         const waitForBufferedDrain = () => new Promise((drainResolve, drainReject) => {
           if (transferComplete || dc.bufferedAmount <= LOW_WATERMARK) {
@@ -211,7 +256,9 @@ function App() {
         ws.onmessage = async (event) => {
           try {
             const msg = JSON.parse(event.data);
-            if (msg.type === 'peer_connected') {
+            if (msg.type === 'http_fallback') {
+              enterHttpFallback();
+            } else if (msg.type === 'peer_connected') {
               setUploadStatus('¡Receptor conectado! Iniciando WebRTC...');
               const offer = await pc.createOffer();
               await pc.setLocalDescription(offer);
@@ -221,10 +268,12 @@ function App() {
             } else if (msg.type === 'ice' && msg.candidate) {
               await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
             } else if (msg.type === 'peer_disconnected') {
-              reject(new Error('El receptor se desconectó antes de completar la transferencia'));
+              if (!transferComplete && !httpFallback) {
+                reject(new Error('El receptor se desconectó antes de completar la transferencia'));
+              }
             } else if (msg.type === 'curl_download_connected') {
               // El receptor es curl: saltar WebRTC y subir el archivo via HTTP PUT
-              setUploadStatus('Receptor curl conectado. Enviando archivo...');
+              setUploadStatus('Receptor HTTP conectado. Enviando archivo...');
               try {
                 const file = selectedFile;
                 const metadata = { type: 'metadata', name: file.name, size: file.size, mime: file.type || 'application/octet-stream' };
@@ -249,13 +298,20 @@ function App() {
             if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(metadata));
             dc.send(JSON.stringify(metadata));
 
-            // El receptor confirma que ya puede guardar antes de enviar datos
+            // El receptor confirma que ya puede guardar antes de enviar datos.
+            // Si no puede escribir a disco, pide el relay HTTP y este camino
+            // termina; el PUT lo lanzará curl_download_connected.
+            let mode;
             try {
-              await withTimeout(readyPromise, READY_TIMEOUT_MS, 'El receptor no confirmó que está listo para guardar el archivo');
+              mode = await Promise.race([
+                withTimeout(readyPromise, READY_TIMEOUT_MS, 'El receptor no confirmó que está listo para guardar el archivo').then(() => 'webrtc'),
+                fallbackPromise.then(() => 'http'),
+              ]);
             } catch (e) {
               reject(e);
               return;
             }
+            if (mode === 'http') return;
 
             // Enviar archivo en chunks con control de flujo (backpressure)
             const CHUNK = 16 * 1024;
@@ -269,6 +325,13 @@ function App() {
               const buf = await slice.arrayBuffer();
               dc.send(buf);
               offset += buf.byteLength;
+              if (offset - receiverWritten > RECEIVER_WINDOW) {
+                await withTimeout(
+                  waitForReceiverWindow(offset),
+                  PROGRESS_TIMEOUT_MS,
+                  'El receptor dejó de confirmar el progreso de la transferencia'
+                );
+              }
               const now = Date.now();
               if (offset === file.size || now - lastUiUpdate > 120) {
                 const pct = file.size > 0 ? Math.round((offset / file.size) * 100) : 100;
@@ -290,13 +353,13 @@ function App() {
         };
 
         dc.onclose = () => {
-          if (!transferComplete) reject(new Error('Canal P2P cerrado antes de completar la transferencia'));
+          if (!transferComplete && !httpFallback) reject(new Error('Canal P2P cerrado antes de completar la transferencia'));
         };
-        dc.onerror = () => { if (!transferComplete) reject(new Error('Error en el canal de datos P2P')); };
+        dc.onerror = () => { if (!transferComplete && !httpFallback) reject(new Error('Error en el canal de datos P2P')); };
         pc.onconnectionstatechange = () => {
-          if (pc.connectionState === 'failed' && !transferComplete) reject(new Error('Conexión WebRTC fallida'));
+          if (pc.connectionState === 'failed' && !transferComplete && !httpFallback) reject(new Error('Conexión WebRTC fallida'));
         };
-        ws.onerror = () => { if (!transferComplete) reject(new Error('Error de WebSocket')); };
+        ws.onerror = () => { if (!transferComplete && !httpFallback) reject(new Error('Error de WebSocket')); };
       });
 
       setTimeout(() => {
@@ -358,6 +421,8 @@ function App() {
         let writeChain = Promise.resolve();
         let writeError = null;
         let lastUiUpdate = 0;
+        let writtenSize = 0;
+        let lastProgressSent = 0;
         let finishing = false;
         let idleTimer = null;
         let abortHttp = null;
@@ -573,6 +638,14 @@ function App() {
                 .then(async () => {
                   if (writable) await writable.write(buf);
                   else chunks.push(buf);
+                  writtenSize += buf.byteLength;
+                  if (writtenSize - lastProgressSent >= PROGRESS_INTERVAL) {
+                    lastProgressSent = writtenSize;
+                    try {
+                      dataChannel?.send(JSON.stringify({ type: 'progress', received: writtenSize }));
+                      resetIdle();
+                    } catch (_) { /* el canal ya se cerró */ }
+                  }
                 })
                 .catch((err) => { writeError = err; });
 

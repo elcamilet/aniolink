@@ -15,7 +15,7 @@ Adáptalo a tus necesidades y compárteme tus mejoras, es **Open Source**
 
 El servidor actúa como punto de encuentro entre emisor y receptor. Los datos **nunca se almacenan en disco**. Hay cuatro modos de transferencia según quién envía y quién recibe:
 
-**Browser → Browser** (P2P puro via WebRTC DataChannel):
+**Browser → Browser** (WebRTC DataChannel; si el receptor no soporta File System Access, los archivos grandes se descargan por el relay HTTP):
 ```
 Browser (emisor)        Servidor               Browser (receptor)
   |--- WS /signal ------->|<------ WS /signal ---|
@@ -68,7 +68,7 @@ Vite, React, Tailwind CSS
 - **Drag & Drop** para seleccionar archivos
 - **Generación automática de tokens** para compartir
 - **Descarga directa** mediante tokens o URLs compartidas (página `/token` independiente del SPA)
-- **Transferencias grandes con guardado incremental** — en navegadores con File System Access API (Chrome/Edge) el receptor escribe a disco; sin esa API el archivo se carga en memoria y los tamaños muy grandes pueden fallar. El timeout es por inactividad, no por duración total
+- **Transferencias grandes con guardado incremental** — en navegadores con File System Access API (Chrome/Edge) el receptor escribe a disco; sin esa API la página usa el relay HTTP y el gestor de descargas del navegador, sin cargar el archivo en memoria. El timeout es por inactividad, no por duración total
 - **Interfaz minimalista y moderna**
 
 ## Contenedores Docker

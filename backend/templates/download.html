@@ -53,6 +53,7 @@
       </div>
       <p id="status" class="status"></p>
     </div>
+    <button id="http-btn" class="btn" style="display:none;margin-top:1rem" onclick="startHttpDownload()">Guardar con el navegador</button>
     <p class="note">El archivo se transferirá directamente desde el remitente</p>
     $error_msg
   </div>
@@ -73,7 +74,26 @@
     const ICE = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }] };
     const LARGE_FILE_THRESHOLD = 1024 * 1024 * 1024;
     const IDLE_TIMEOUT_MS = 60000;
+    const PROGRESS_INTERVAL = 1024 * 1024;
     const supportsFsa = typeof window.showSaveFilePicker === 'function';
+    let httpFallbackTarget = null;
+    let finishHttpFallback = null;
+
+    function startHttpDownload() {
+      if (!httpFallbackTarget) return;
+      const btn = document.getElementById('http-btn');
+      const status = document.getElementById('status');
+      startNativeDownload(httpFallbackTarget.url, httpFallbackTarget.filename);
+      if (btn) { btn.disabled = true; btn.textContent = 'Descarga iniciada'; }
+      if (status) status.textContent = 'Descarga iniciada en el gestor de descargas del navegador...';
+      // El GET ya arrancó; esperar un momento antes de cerrar el WebSocket
+      // para que al emisor le haya llegado http_fallback.
+      setTimeout(() => {
+        const finish = finishHttpFallback;
+        finishHttpFallback = null;
+        if (finish) finish();
+      }, 1000);
+    }
 
     async function openDiskWriter(filename) {
       if (!supportsFsa) return null;
@@ -103,7 +123,7 @@
     function startNativeDownload(url, filename) {
       const a = document.createElement('a');
       a.href = url;
-      a.download = filename || '';
+      if (filename) a.download = filename;
       a.style.display = 'none';
       document.body.appendChild(a);
       a.click();
@@ -118,8 +138,20 @@
       const status = document.getElementById('status');
 
       btn.disabled = true;
-      btn.textContent = 'Conectando...';
       section.style.display = 'block';
+
+      // Sin File System Access no hay forma de escribir a disco desde JS.
+      // Se usa el relay HTTP y el gestor de descargas del navegador: el
+      // archivo no se acumula en memoria. El servidor avisa al emisor por
+      // WebSocket y el emisor cambia al PUT.
+      if (!supportsFsa) {
+        btn.textContent = 'Descarga iniciada';
+        status.textContent = 'Este navegador no permite guardar directamente en disco. La descarga usará el relay del servidor y el gestor de descargas del navegador.';
+        startNativeDownload(window.location.origin + '/' + TOKEN + '?dl=1', '');
+        return;
+      }
+
+      btn.textContent = 'Conectando...';
       status.textContent = 'Conectando al servidor de señalización...';
 
       let ws = null;
@@ -153,6 +185,8 @@
           let writable = null;
           let writeChain = Promise.resolve();
           let writeError = null;
+          let writtenSize = 0;
+          let lastProgressSent = 0;
           let finishing = false;
           let idleTimer = null;
           let abortHttp = null;
@@ -355,10 +389,30 @@
                           }
                         }
                         if (!writable && metadata.size > LARGE_FILE_THRESHOLD) {
-                          if (!window.confirm('Tu navegador no permite guardar en disco desde esta página. El archivo se cargará en memoria y puede fallar. ¿Continuar?')) {
-                            reject(new Error('Descarga cancelada'));
-                            return;
+                          // No se puede escribir a disco: pasar el archivo al
+                          // relay HTTP y dejar que el navegador lo guarde. Así
+                          // no se acumulan GB en memoria.
+                          try {
+                            dc.send(JSON.stringify({ type: 'http_fallback' }));
+                          } catch (_) { /* el canal ya se cerró */ }
+                          try {
+                            ws.send(JSON.stringify({ type: 'http_fallback' }));
+                          } catch (_) { /* el WS ya se cerró */ }
+                          if (idleTimer) clearTimeout(idleTimer);
+                          transferComplete = true;
+                          httpFallbackTarget = {
+                            url: window.location.origin + '/' + TOKEN + '?dl=1',
+                            filename: metadata.name,
+                          };
+                          const httpBtn = document.getElementById('http-btn');
+                          if (httpBtn) {
+                            httpBtn.style.display = 'block';
+                            httpBtn.disabled = false;
+                            httpBtn.textContent = 'Guardar con el navegador';
                           }
+                          status.textContent = 'Archivo grande: usa el botón para descargarlo sin cargarlo en memoria.';
+                          finishHttpFallback = resolve;
+                          return;
                         }
                         dc.send(JSON.stringify({ type: 'ready' }));
                         resetIdle();
@@ -380,6 +434,14 @@
                   .then(async () => {
                     if (writable) await writable.write(buf);
                     else chunks.push(buf);
+                    writtenSize += buf.byteLength;
+                    if (writtenSize - lastProgressSent >= PROGRESS_INTERVAL) {
+                      lastProgressSent = writtenSize;
+                      try {
+                        dataChannel?.send(JSON.stringify({ type: 'progress', received: writtenSize }));
+                        resetIdle();
+                      } catch (_) { /* el canal ya se cerró */ }
+                    }
                   })
                   .catch((err) => { writeError = err; });
 

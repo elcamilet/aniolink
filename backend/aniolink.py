@@ -353,12 +353,13 @@ async def download_p2p(
     bridge.transfer_active = True
     bridge.touch()
     bridge.download_connected.set()
-    # Si hay un emisor browser esperando por WebSocket, avisarle que el receptor es curl
-    if bridge.up_ws is not None:
+    # Avisar a cualquier emisor browser (esté en up o en down) de que el
+    # receptor va a descargar por HTTP. El receptor curl/no-FSA no abre WS.
+    for ws_client in filter(None, [bridge.up_ws, bridge.down_ws]):
         try:
-            await bridge.up_ws.send_json({"type": "curl_download_connected"})
+            await ws_client.send_json({"type": "curl_download_connected"})
         except Exception as e:
-            logger.warning(f"No se pudo notificar al emisor del receptor curl: {e}")
+            logger.warning(f"No se pudo notificar al emisor del receptor HTTP: {e}")
     try:
         await asyncio.wait_for(bridge.upload_ready.wait(), timeout=TIMEOUT_SECONDS)
     except asyncio.TimeoutError:

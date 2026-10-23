@@ -47,7 +47,7 @@ The server stays in the background; stop it when finished.
 
 - **Single process only.** `active_bridges` and WebSocket peers are in memory; `uvicorn --workers N` or multiple replicas split tokens and break transfers.
 - **No server-side file storage or full-body buffering.** Use `request.stream()` and relay chunks directly; never read an upload with `await request.body()`.
-- **Browser receivers stream to disk when the browser supports `showSaveFilePicker`**; otherwise they fall back to `chunks` → `Blob` and multi-GB downloads can still exhaust memory. The HTTP relay has an additional native-download fallback for large files without FSA. Server-side relay streaming is unbounded. Keep both receivers (`App.jsx` and `download.html`) in sync.
+- **Browser receivers stream to disk when the browser supports `showSaveFilePicker`.** Without FSA, `download.html` skips WebRTC and downloads through the HTTP relay (`?dl=1`) with the browser's download manager, so it never buffers a large file. If FSA exists but the picker fails for a file over 1 GB, the DataChannel sends `http_fallback` and the page offers a native-download button. The SPA's `handleDownload` is unreachable from the UI; `download.html` is the receiver that ships. Keep both copies in sync. Server-side relay streaming is unbounded.
 - **Python 3.9** in the image: no `X | Y` unions, `match`, or other 3.10+ syntax.
 - **No Vite proxy.** `App.jsx` uses `window.location.origin` as the API base, so `npm run dev` on :5173 cannot reach the backend. Use Docker, or place a built `frontend/dist` in `static/` at the repo root (don't commit it) and run `uvicorn backend.aniolink:app` from there.
 - `python aniolink.py` calls `uvicorn.run()` before the bottom `StaticFiles` mount, so that entrypoint never serves the SPA; the mount only runs when an ASGI server imports the module (uvicorn/Docker). Put any new import-time setup above the `if __name__ == "__main__"` block, and declare API routes before the mount.
@@ -61,7 +61,8 @@ The server stays in the background; stop it when finished.
 ## Transfer protocol
 
 - Four modes: browser↔browser (WebRTC DataChannel), curl↔curl (HTTP streaming), browser→curl, curl→browser.
-- `WS /{token}/signal`: first socket is assigned `up`, second `down` (connection order, not always sender/receiver when the other side uses curl). It relays `offer`, `answer`, `ice`; the server sends `peer_connected`, `peer_disconnected`, `curl_download_connected`, `http_upload_available`. `metadata` is relayed and stored for `/info`.
+- `WS /{token}/signal`: first socket is assigned `up`, second `down` (connection order, not always sender/receiver when the other side uses curl). It relays `offer`, `answer`, `ice`; the server sends `peer_connected`, `peer_disconnected`, `curl_download_connected` (to both sockets), `http_upload_available`. `metadata` is relayed and stored for `/info`.
+- DataChannel messages: `metadata`, `ready`, binary chunks, `progress`, `eof`, `ack`; `http_fallback` asks the sender to switch to the HTTP relay when the receiver cannot write to disk.
 - `PUT /{token}/{filename}` always reads `request.stream()`. The SPA sends the raw `File` body, not `FormData`; curl sends the file body. Keep that contract.
 - `GET /{token}` waits for the upload then streams. Auxiliary endpoints: `GET /{token}/status`, `GET /status/`, `GET /{token}/info`.
 - Tokens expire via a 10-second cleanup task, and eagerly on `/token` and `/status/`.
